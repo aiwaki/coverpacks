@@ -7,6 +7,8 @@ name = "coverpacks"
 version = "0.1.0"
 description = "Album cover collection and Telegram emoji packs"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "httpx==0.28.1",
     "Pillow==12.1.1",
