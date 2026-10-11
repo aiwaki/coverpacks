@@ -26,6 +26,8 @@ class FakeTelegram:
     def __init__(self):
         self.account = {"id": 123, "premium": True}
         self.channels, self.sets, self.posts, self.events = [], {}, {}, []
+        self.scheduled_posts = {}
+        self.scheduled_ids = 10000
         self.failures, self.documents = {}, 100
         self.find_posts = True
         self.content_verified = False
@@ -122,18 +124,47 @@ class FakeTelegram:
         self.failure("set_thumbnail", "before")
         self.failure("set_thumbnail", "after")
 
-    async def find_post(self, channel, text):
+    async def find_post(self, channel, text, photo_path=None):
         self.events.append(("find_post",))
         self.failure("find_post", "before")
         if self.find_posts:
             for post in self.posts.values():
-                if post["body"] == text:
+                if post["body"] == text and (photo_path is None or post.get("photo_path") == photo_path):
                     return {"id": post["id"], "link": post["link"]}
         return None
 
-    async def send_post(self, channel, text, random_id, emoji_documents=None, links=None, photo_path=None, *, formatting=None):
+    async def find_scheduled_post(self, channel, text, photo_path=None):
+        self.events.append(("find_scheduled_post", text, photo_path))
+        self.failure("find_scheduled_post", "before")
+        for post in self.scheduled_posts.values():
+            if post["body"] == text and (photo_path is None or post.get("photo_path") == photo_path):
+                return {"id": post["id"], "scheduled_for": post["scheduled_for"], "scheduled": True}
+        return None
+
+    def deliver_scheduled(self, random_ids=None):
+        delivered = []
+        for random_id in list(self.scheduled_posts) if random_ids is None else random_ids:
+            queued = self.scheduled_posts.pop(random_id)
+            message_id = 100 + len(self.posts)
+            self.posts[random_id] = dict(queued, id=message_id,
+                link=f"https://t.me/{queued['username']}/{message_id}")
+            delivered.append({"id": message_id, "link": self.posts[random_id]["link"]})
+        return delivered
+
+    async def send_post(self, channel, text, random_id, emoji_documents=None, links=None, photo_path=None, *, formatting=None, schedule_at=None):
         self.events.append(("send_post", random_id, text))
         self.failure("send_post", "before")
+        if schedule_at is not None and random_id not in self.posts:
+            if random_id not in self.scheduled_posts:
+                self.scheduled_ids += 1
+                self.scheduled_posts[random_id] = {
+                    "id": self.scheduled_ids, "scheduled_for": schedule_at, "username": channel["username"],
+                    "body": text, "documents": emoji_documents, "links": links,
+                    "photo_path": photo_path, "formatting": formatting,
+                }
+            self.failure("send_post", "after")
+            result = self.scheduled_posts[random_id]
+            return {"id": result["id"], "scheduled_for": result["scheduled_for"], "scheduled": True}
         if random_id not in self.posts:
             message_id = 100 + len(self.posts)
             self.posts[random_id] = {"id": message_id, "link": f"https://t.me/{channel['username']}/{message_id}",
@@ -669,6 +700,31 @@ def test_keyword_update_lost_reply_resumes_without_repeating_write(setup):
     assert [event for event in writes(setup.transport) if event[0]=="change_keywords"]==changes
 
 
+def test_server_trademark_keyword_normalization_does_not_repeat_writes_or_change_visible_titles(setup):
+    document = json.loads(setup.path.read_bytes())
+    document["packs"][0]["items"][0].update(artist="Dreamcastle™", title="Lego Pirates: 1989-1996")
+    setup.path = setup.path.parent / "trademark.json"
+    setup.path.write_text(json.dumps(document))
+    original_manifest = setup.path.read_bytes()
+    create_set = setup.transport.create_set
+
+    async def normalized_create(*args, **kwargs):
+        remote = await create_set(*args, **kwargs)
+        saved = setup.transport.sets[remote["short_name"]]
+        for item in saved["documents"]:
+            item["keywords"] = [word.replace("™", "").casefold() for word in item["keywords"]]
+        return copy.deepcopy(saved)
+
+    setup.transport.create_set = normalized_create
+    first = run(setup)
+    assert not [event for event in writes(setup.transport) if event[0] == "change_keywords"]
+    before = writes(setup.transport)
+    assert run(setup) == first
+    assert writes(setup.transport) == before
+    assert setup.path.read_bytes() == original_manifest
+    assert any("Dreamcastle™ — Lego Pirates: 1989-1996" in post["body"] for post in setup.transport.posts.values())
+
+
 def test_keyword_update_flood_persists_wait_before_further_posts(setup):
     run(setup)
     setup.transport.sets["sleeve_vinyl_001"]["documents"][0]["keywords"]=[]
@@ -698,9 +754,10 @@ def test_search_keywords_fit_service_budget_and_keep_metadata_unchanged(item):
 DAILY_CONFIG = dict(CONFIG, welcome_enabled=False)
 
 
-def publish_next(setup, *, path=None, config=None, interval_seconds=86400):
+def publish_next(setup, *, path=None, config=None, interval_seconds=86400, schedule_ahead_seconds=0):
     return asyncio.run(setup.publisher.publish_next(
-        path or setup.path, config or DAILY_CONFIG, interval_seconds=interval_seconds))
+        path or setup.path, config or DAILY_CONFIG, interval_seconds=interval_seconds,
+        schedule_ahead_seconds=schedule_ahead_seconds))
 
 
 def test_daily_publishes_one_pack_per_anchored_interval_and_keeps_queue(setup):
@@ -1053,3 +1110,392 @@ def test_archive_still_validates_structure_and_duplicate_sources(setup, change):
     path.write_text(json.dumps(document))
     with pytest.raises(PublicationError):
         _validate_manifest(path, archived_packs={pack["short_name"]: digest})
+
+
+@pytest.mark.parametrize("ahead", [-1, 86401, True, False, 1.5, "3600", None])
+def test_scheduled_ahead_rejects_invalid_window_before_state_or_network_changes(setup, ahead):
+    snapshot = setup.state.db.serialize()
+    with pytest.raises(PublicationError):
+        publish_next(setup, schedule_ahead_seconds=ahead)
+    assert setup.transport.events == []
+    assert setup.state.db.serialize() == snapshot
+
+
+def scheduled_case(setup, *, due=2000, now=1000):
+    clock = [now]
+    setup.publisher.now = lambda: clock[0]
+    setup.state.put("daily_next_due_at", due)
+    return clock
+
+
+def test_scheduled_ahead_starts_at_window_boundary_and_retains_active_slot(setup):
+    scheduled_case(setup, due=5000)
+    result = publish_next(setup, schedule_ahead_seconds=3999)
+    assert result["status"] == "not_due" and setup.transport.events == []
+    assert setup.state.get("daily_active_pack") is None
+    result = publish_next(setup, schedule_ahead_seconds=4000)
+    assert result["status"] == "scheduled" and result["pack"] == "sleeve_vinyl_001"
+    active = setup.state.get("daily_active_pack")
+    assert active["scheduled_for"] == active["delivery_at"] == 5000
+    assert active["interval_seconds"] == 86400
+    assert setup.state.get("daily_last_completed_at") is None
+    assert setup.state.get("daily_next_due_at") == 5000
+    assert [pack["status"] for pack in result["report"]["packs"]] == ["scheduled", "planned"]
+    assert result["report"]["packs"][0]["message_ids"] == []
+    assert result["report"]["packs"][0]["links"] == []
+    assert len(setup.transport.scheduled_posts) == 1 and setup.transport.posts == {}
+    post = setup.state.db.execute("SELECT * FROM posts WHERE pack_name='sleeve_vinyl_001'").fetchone()
+    remote = next(iter(setup.transport.scheduled_posts.values()))
+    assert post["status"] == "scheduled" and post["schedule_at"] == 5000
+    assert post["scheduled_message_id"] == remote["id"]
+    assert post["message_id"] is None and post["url"] is None
+
+
+@pytest.mark.parametrize("due,now,interval,delivery", [
+    (2000, 1000, 1000, 2000),
+    (1900, 1000, 100, 2000),
+    (1060, 1000, 1000, 2060),
+    (900, 1000, 1000, 2900),
+    (900, 5000, 1000, 6900),
+])
+def test_scheduled_delivery_uses_first_anchor_slot_beyond_preparation_margin(setup, due, now, interval, delivery):
+    scheduled_case(setup, due=due, now=now)
+    result = publish_next(setup, interval_seconds=interval, schedule_ahead_seconds=86400)
+    active = setup.state.get("daily_active_pack")
+    assert result["status"] == "scheduled"
+    assert active["scheduled_for"] == due and active["delivery_at"] == delivery
+    assert delivery > now + 900 and (delivery - due) % interval == 0
+    assert next(iter(setup.transport.scheduled_posts.values()))["scheduled_for"] == delivery
+    assert setup.transport.posts == {}
+
+
+def test_scheduled_intent_pins_delivery_and_mode_across_restart_and_option_changes(setup):
+    scheduled_case(setup)
+    setup.transport.fail("me")
+    with pytest.raises(OSError):
+        publish_next(setup, interval_seconds=1000, schedule_ahead_seconds=1000)
+    original = copy.deepcopy(setup.state.get("daily_active_pack"))
+    assert original["scheduled_for"] == original["delivery_at"] == 2000
+    future = json.loads(setup.path.read_bytes())
+    future["packs"][1]["title"] = "Changed future plan"
+    future_path = setup.path.parent / "another-plan.json"
+    future_path.write_text(json.dumps(future))
+    ledger_path = setup.state.path
+    setup.state.close()
+    setup.state = PublicationState(ledger_path)
+    # The same delivery is now inside the 15-minute preparation margin, but
+    # remains safely beyond the 60-second send cutoff and must not move.
+    setup.publisher = Publisher(setup.state, setup.transport, now=lambda: 1500)
+    result = publish_next(setup, path=future_path, interval_seconds=10, schedule_ahead_seconds=0)
+    assert result["status"] == "scheduled" and result["pack"] == original["short_name"]
+    assert setup.state.get("daily_active_pack") == original
+    assert next(iter(setup.transport.scheduled_posts.values()))["scheduled_for"] == 2000
+    assert setup.transport.posts == {} and len(setup.transport.sets) == 1
+
+
+def test_scheduled_lost_send_response_reconciles_queue_and_checkpoints_without_resend(setup):
+    scheduled_case(setup)
+    setup.transport.fail("send_post", "after")
+    with pytest.raises(OSError):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    first = setup.state.db.execute("SELECT * FROM posts").fetchone()
+    assert first["status"] == "sending" and first["schedule_at"] == 2000
+    assert len(setup.transport.scheduled_posts) == 1 and setup.transport.posts == {}
+    writes_before = writes(setup.transport)
+    saved = []
+    async def checkpoint():
+        saved.extend(dict(row) for row in setup.state.db.execute("SELECT * FROM posts WHERE status='scheduled'"))
+    setup.publisher.checkpoint = checkpoint
+    result = publish_next(setup, schedule_ahead_seconds=0)
+    assert result["status"] == "scheduled"
+    assert writes(setup.transport) == writes_before
+    remote = next(iter(setup.transport.scheduled_posts.values()))
+    assert saved and saved[-1]["scheduled_message_id"] == remote["id"]
+    assert saved[-1]["message_id"] is None
+    assert setup.state.get("daily_active_pack") is not None
+
+
+def test_scheduled_repeat_checks_history_before_queue_and_never_writes_again(setup):
+    clock = scheduled_case(setup)
+    publish_next(setup, schedule_ahead_seconds=3600)
+    before = writes(setup.transport)
+    setup.transport.events.clear()
+    # A queue item may still be visible while its due-time delivery is pending.
+    clock[0] = 2001
+    result = publish_next(setup, schedule_ahead_seconds=0)
+    assert result["status"] == "scheduled"
+    assert writes(setup.transport) == []
+    operations = [event[0] for event in setup.transport.events]
+    assert operations.index("find_post") < operations.index("find_scheduled_post")
+    assert len(setup.transport.scheduled_posts) == 1 and setup.transport.posts == {}
+    assert setup.state.get("daily_last_completed_at") is None
+    assert setup.state.get("daily_active_pack")["delivery_at"] == 2000
+    assert len([event for event in before if event[0] == "send_post"]) == 1
+
+
+def test_scheduled_delivery_reconciles_new_history_ids_before_completing_cadence(setup):
+    clock = scheduled_case(setup)
+    publish_next(setup, interval_seconds=3600, schedule_ahead_seconds=3600)
+    queued_id = next(iter(setup.transport.scheduled_posts.values()))["id"]
+    delivered = setup.transport.deliver_scheduled()
+    assert delivered[0]["id"] != queued_id
+    setup.transport.events.clear()
+    clock[0] = 2010
+    result = publish_next(setup, schedule_ahead_seconds=0)
+    assert result["status"] == "published" and result["pack"] == "sleeve_vinyl_001"
+    assert result["next_due_at"] == 5600
+    assert result["report"]["packs"][0]["message_ids"] == [delivered[0]["id"]]
+    assert result["report"]["packs"][0]["links"] == [delivered[0]["link"]]
+    post = setup.state.db.execute("SELECT * FROM posts").fetchone()
+    assert post["status"] == "sent" and post["message_id"] == delivered[0]["id"]
+    assert setup.state.get("daily_active_pack") is None
+    assert setup.state.get("daily_last_completed_at") == 2010
+    assert setup.state.db.execute("SELECT status FROM packs WHERE number=2").fetchone()[0] == "planned"
+    assert not any(event[0] == "find_scheduled_post" for event in setup.transport.events)
+    assert writes(setup.transport) == []
+
+
+@pytest.mark.parametrize("now", [1100, 2100])
+def test_confirmed_scheduled_post_missing_from_queue_and_history_fails_closed(setup, now):
+    clock = scheduled_case(setup)
+    publish_next(setup, schedule_ahead_seconds=3600)
+    setup.transport.scheduled_posts.clear()
+    setup.transport.events.clear()
+    clock[0] = now
+    with pytest.raises(ReconciliationRequired):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    assert writes(setup.transport) == [] and setup.transport.posts == {}
+    assert setup.state.get("daily_active_pack") is not None
+    assert setup.state.db.execute("SELECT status FROM posts").fetchone()[0] == "scheduled"
+
+
+@pytest.mark.parametrize("lost_response", [False, True])
+def test_scheduled_queue_date_drift_fails_without_resend(setup, lost_response):
+    scheduled_case(setup)
+    if lost_response:
+        setup.transport.fail("send_post", "after")
+        with pytest.raises(OSError):
+            publish_next(setup, schedule_ahead_seconds=3600)
+    else:
+        publish_next(setup, schedule_ahead_seconds=3600)
+    next(iter(setup.transport.scheduled_posts.values()))["scheduled_for"] += 1
+    setup.transport.events.clear()
+    with pytest.raises(ReconciliationRequired):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    assert writes(setup.transport) == [] and setup.transport.posts == {}
+    assert setup.state.get("daily_active_pack")["delivery_at"] == 2000
+
+
+def test_confirmed_scheduled_queue_id_replacement_fails_without_resend(setup):
+    scheduled_case(setup)
+    publish_next(setup, schedule_ahead_seconds=3600)
+    recorded = setup.state.db.execute("SELECT scheduled_message_id FROM posts").fetchone()[0]
+    next(iter(setup.transport.scheduled_posts.values()))["id"] += 1
+    setup.transport.events.clear()
+    with pytest.raises(ReconciliationRequired):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    assert writes(setup.transport) == []
+    assert setup.state.db.execute("SELECT scheduled_message_id FROM posts").fetchone()[0] == recorded
+
+
+@pytest.mark.parametrize("retry_now,can_schedule", [(1100, True), (1940, False)])
+def test_partial_scheduled_pack_retries_only_planned_posts_and_never_falls_back_immediate(setup, monkeypatch, retry_now, can_schedule):
+    clock = scheduled_case(setup)
+    monkeypatch.setattr("coverpacks.publisher._pack_posts", lambda *_args: [
+        {"body": "Scheduled part 1", "documents": [], "links": []},
+        {"body": "Scheduled part 2", "documents": [], "links": []},
+    ])
+    async def interrupted_checkpoint():
+        rows = list(setup.state.db.execute("SELECT status FROM posts ORDER BY part"))
+        if [row[0] for row in rows] == ["scheduled", "planned"]:
+            raise OSError("first part queued, second part still planned")
+    setup.publisher.checkpoint = interrupted_checkpoint
+    with pytest.raises(OSError, match="second part still planned"):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    assert len(setup.transport.scheduled_posts) == 1
+    first_random_id = next(iter(setup.transport.scheduled_posts))
+    setup.publisher.checkpoint = None
+    clock[0] = retry_now
+    if can_schedule:
+        result = publish_next(setup, schedule_ahead_seconds=0)
+        assert result["status"] == "scheduled"
+        assert len(setup.transport.scheduled_posts) == 2
+        assert [row[0] for row in setup.state.db.execute("SELECT status FROM posts ORDER BY part")] == ["scheduled", "scheduled"]
+    else:
+        with pytest.raises(ReconciliationRequired):
+            publish_next(setup, schedule_ahead_seconds=0)
+        assert len(setup.transport.scheduled_posts) == 1
+    sends = [event for event in setup.transport.events if event[0] == "send_post"]
+    assert sum(event[1] == first_random_id for event in sends) == 1
+    assert len(sends) == (2 if can_schedule else 1)
+    assert setup.transport.posts == {} and len(setup.transport.sets) == 1
+    assert setup.state.get("daily_active_pack")["delivery_at"] == 2000
+
+
+@pytest.mark.parametrize("retry_now,can_schedule", [(1939, True), (1940, False), (2001, False)])
+def test_scheduled_sending_without_remote_copy_obeys_pinned_sixty_second_cutoff(setup, retry_now, can_schedule):
+    clock = scheduled_case(setup)
+    setup.transport.fail("send_post", "before")
+    with pytest.raises(OSError):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    assert setup.state.db.execute("SELECT status FROM posts").fetchone()[0] == "sending"
+    assert setup.transport.scheduled_posts == {}
+    setup.transport.events.clear()
+    clock[0] = retry_now
+    if can_schedule:
+        assert publish_next(setup, schedule_ahead_seconds=0)["status"] == "scheduled"
+        assert len(setup.transport.scheduled_posts) == 1
+    else:
+        with pytest.raises(ReconciliationRequired):
+            publish_next(setup, schedule_ahead_seconds=0)
+        assert writes(setup.transport) == [] and setup.transport.scheduled_posts == {}
+    assert setup.transport.posts == {}
+    assert setup.state.get("daily_active_pack")["delivery_at"] == 2000
+
+
+@pytest.mark.parametrize("anchor_present", [False, True])
+def test_legacy_active_without_delivery_at_remains_immediate_when_scheduling_enabled(setup, anchor_present):
+    setup.publisher.now = lambda: 1000
+    setup.transport.fail("me")
+    with pytest.raises(OSError):
+        publish_next(setup)
+    active = setup.state.get("daily_active_pack")
+    assert "delivery_at" not in active
+    if not anchor_present:
+        active.pop("scheduled_for", None)
+        setup.state.put("daily_active_pack", active)
+    result = publish_next(setup, schedule_ahead_seconds=86400)
+    assert result["status"] == "published"
+    assert len(setup.transport.posts) == 1 and setup.transport.scheduled_posts == {}
+    assert setup.state.db.execute("SELECT schedule_at FROM posts").fetchone()[0] is None
+    assert not any(event[0] == "find_scheduled_post" for event in setup.transport.events)
+
+
+def test_scheduled_photo_reconciliation_passes_photo_path_to_both_lookups(setup):
+    scheduled_case(setup)
+    config = dict(DAILY_CONFIG, photo_previews=True)
+    seen_history_photos = []
+    original_find = setup.transport.find_post
+    async def find_with_photo(channel, text, photo_path=None):
+        seen_history_photos.append(photo_path)
+        return await original_find(channel, text, photo_path)
+    setup.transport.find_post = find_with_photo
+    assert publish_next(setup, config=config, schedule_ahead_seconds=3600)["status"] == "scheduled"
+    queued = next(iter(setup.transport.scheduled_posts.values()))
+    assert queued["photo_path"] and Path(queued["photo_path"]).is_file()
+    seen_history_photos.clear()
+    setup.transport.events.clear()
+    assert publish_next(setup, config=config, schedule_ahead_seconds=0)["status"] == "scheduled"
+    assert seen_history_photos == [queued["photo_path"]]
+    lookups = [event for event in setup.transport.events if event[0] == "find_scheduled_post"]
+    assert len(lookups) == 1 and lookups[0][2] == queued["photo_path"]
+    assert writes(setup.transport) == []
+
+
+@pytest.mark.parametrize("delivery", [None, True, False, 0, -1, 2000.0, "2000", float("inf"), float("nan")])
+def test_scheduled_corrupt_active_delivery_fails_before_network_or_state_changes(setup, delivery):
+    scheduled_case(setup)
+    setup.transport.fail("me")
+    with pytest.raises(OSError):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    active = setup.state.get("daily_active_pack")
+    active["delivery_at"] = delivery
+    setup.state.put("daily_active_pack", active)
+    setup.transport.events.clear()
+    snapshot = setup.state.db.serialize()
+    with pytest.raises(ReconciliationRequired):
+        publish_next(setup, schedule_ahead_seconds=0)
+    assert setup.transport.events == []
+    assert setup.state.db.serialize() == snapshot
+
+
+def test_scheduled_delivery_without_pinned_anchor_fails_before_network(setup):
+    scheduled_case(setup)
+    setup.transport.fail("me")
+    with pytest.raises(OSError):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    active = setup.state.get("daily_active_pack")
+    del active["scheduled_for"]
+    setup.state.put("daily_active_pack", active)
+    setup.transport.events.clear()
+    with pytest.raises(ReconciliationRequired):
+        publish_next(setup, schedule_ahead_seconds=0)
+    assert setup.transport.events == []
+
+
+@pytest.mark.parametrize("scheduled,changed_date", [(True, None), (True, 2001), (False, 2000)])
+def test_scheduled_post_date_drift_from_active_intent_fails_before_context(setup, scheduled, changed_date):
+    if scheduled:
+        scheduled_case(setup)
+        publish_next(setup, schedule_ahead_seconds=3600)
+    else:
+        setup.publisher.now = lambda: 1000
+        setup.transport.fail("send_post", "before")
+        with pytest.raises(OSError):
+            publish_next(setup)
+    with setup.state.db:
+        setup.state.db.execute("UPDATE posts SET schedule_at=?", (changed_date,))
+    setup.transport.events.clear()
+    snapshot = setup.state.db.serialize()
+    with pytest.raises(ReconciliationRequired):
+        publish_next(setup, schedule_ahead_seconds=0)
+    assert setup.transport.events == []
+    assert setup.state.db.serialize() == snapshot
+
+
+def test_manual_run_respects_queued_first_pack_without_creating_the_next_one(setup):
+    scheduled_case(setup)
+    publish_next(setup, schedule_ahead_seconds=3600)
+    active = copy.deepcopy(setup.state.get("daily_active_pack"))
+    setup.transport.events.clear()
+    report = run(setup, config=DAILY_CONFIG)
+    assert [pack["status"] for pack in report["packs"]] == ["scheduled", "planned"]
+    assert list(setup.transport.sets) == ["sleeve_vinyl_001"]
+    assert len(setup.transport.scheduled_posts) == 1 and setup.transport.posts == {}
+    assert writes(setup.transport) == []
+    assert setup.state.get("daily_active_pack") == active
+
+
+def test_scheduled_send_rechecks_cutoff_after_slow_checkpoint_before_transport(setup):
+    clock = scheduled_case(setup)
+    send_checkpoints = []
+    async def slow_checkpoint():
+        operation = setup.state.get("last_operation") or ""
+        if operation.startswith("send_post:"):
+            post = setup.state.db.execute("SELECT * FROM posts").fetchone()
+            send_checkpoints.append((post["status"], post["schedule_at"]))
+            clock[0] = 1940  # Exactly delivery_at - 60: sending now could become immediate.
+    setup.publisher.checkpoint = slow_checkpoint
+    with pytest.raises(ReconciliationRequired):
+        publish_next(setup, schedule_ahead_seconds=3600)
+    assert send_checkpoints == [("sending", 2000)]
+    assert not any(event[0] == "send_post" for event in setup.transport.events)
+    assert setup.transport.posts == setup.transport.scheduled_posts == {}
+    assert setup.state.db.execute("SELECT status FROM posts").fetchone()[0] == "sending"
+    assert setup.state.get("daily_active_pack")["delivery_at"] == 2000
+
+
+def test_scheduled_pack_completes_only_after_every_queued_part_reaches_history(setup, monkeypatch):
+    clock = scheduled_case(setup)
+    monkeypatch.setattr("coverpacks.publisher._pack_posts", lambda *_args: [
+        {"body": "Scheduled part 1", "documents": [], "links": []},
+        {"body": "Scheduled part 2", "documents": [], "links": []},
+    ])
+    assert publish_next(setup, schedule_ahead_seconds=3600)["status"] == "scheduled"
+    random_ids = list(setup.transport.scheduled_posts)
+    first = setup.transport.deliver_scheduled([random_ids[0]])[0]
+    setup.transport.events.clear()
+    clock[0] = 2010
+    partial = publish_next(setup, schedule_ahead_seconds=0)
+    assert partial["status"] == "scheduled"
+    assert [row[0] for row in setup.state.db.execute("SELECT status FROM posts ORDER BY part")] == ["sent", "scheduled"]
+    assert setup.state.get("daily_active_pack") is not None
+    assert setup.state.get("daily_last_completed_at") is None
+    assert setup.state.db.execute("SELECT status FROM packs WHERE number=1").fetchone()[0] == "scheduled"
+    second = setup.transport.deliver_scheduled([random_ids[1]])[0]
+    complete = publish_next(setup, schedule_ahead_seconds=0)
+    assert complete["status"] == "published"
+    assert complete["report"]["packs"][0]["message_ids"] == [first["id"], second["id"]]
+    assert complete["report"]["packs"][0]["links"] == [first["link"], second["link"]]
+    assert setup.state.get("daily_active_pack") is None
+    assert writes(setup.transport) == []

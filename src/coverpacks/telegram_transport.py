@@ -7,6 +7,7 @@ Only selected public metadata and document references leave the adapter.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 from io import BytesIO
 import json
 import logging
@@ -24,7 +25,7 @@ class TelegramResultError(RuntimeError):
 
 
 _STATIC_EMOJI_MAX_BYTES = 512 * 1024
-_CONTENT_RMSE_LIMIT = 32
+_CONTENT_RMSE_LIMIT = 4
 _CONTENT_LOWPASS_SIZE = (32, 32)
 _CONTENT_LOWPASS_LIMIT = 12
 _LOG = logging.getLogger(__name__)
@@ -81,6 +82,20 @@ def _rgb_rmse(actual: Image.Image, expected: Image.Image) -> float:
 def _visible_rgb(rgba: Image.Image) -> Image.Image:
     """Weight colors by alpha; transparent WebP pixels have arbitrary RGB."""
     return ImageChops.multiply(rgba.convert("RGB"), rgba.getchannel("A").convert("RGB"))
+
+
+def _webp_rgb_model(rgba: Image.Image) -> Image.Image:
+    """Model the observed server conversion, without fitting each remote image.
+
+    Lossy WebP subsamples chroma; its decoded fine color edges can differ greatly
+    from the lossless source. This one fixed encoder setting matched the saved
+    server conversions. A small residual budget accommodates codec differences;
+    alpha, original lowpass color and source uniqueness remain separate checks.
+    """
+    buffer = BytesIO()
+    rgba.save(buffer, "WEBP", quality=85, method=4)
+    with Image.open(BytesIO(buffer.getvalue())) as converted:
+        return _visible_rgb(converted.convert("RGBA"))
 
 
 def _validate_photo(path: str | Path, caption: str, max_caption_length: int) -> Path:
@@ -193,6 +208,17 @@ def _validated_keywords(value: str) -> tuple[str, list[str]]:
     return ",".join(words), words
 
 
+def canonical_keywords(values: list[str]) -> list[str]:
+    """Compare search phrases with only observed Telegram normalization.
+
+    The server lowercases phrases and removed U+2122 from a verified keyword
+    response. Preserve every other symbol and phrase, including duplicates;
+    this is not a general punctuation/Unicode folding rule. Visible metadata
+    and the submitted keywords remain unchanged.
+    """
+    return sorted(value.replace("\u2122", "").casefold() for value in values)
+
+
 def _post_record(channel: dict, message_id: int) -> dict:
     if channel.get("username"):
         link = f"https://t.me/{channel['username']}/{message_id}"
@@ -207,6 +233,27 @@ def _matches_post(message: Any, channel: dict, text: str | None = None) -> bool:
             and isinstance(message.peer_id, types.PeerChannel)
             and message.peer_id.channel_id == int(channel["id"])
             and (text is None or message.message == text))
+
+
+def _scheduled_post_record(messages: list, channel: dict, text: str,
+                           photo_path: str | Path | None = None) -> dict | None:
+    matches = [message for message in messages if isinstance(message, types.Message)
+               and isinstance(message.peer_id, types.PeerChannel)
+               and message.peer_id.channel_id == int(channel["id"]) and message.message == text]
+    if len(matches) > 1:
+        raise TelegramResultError("Scheduled post is ambiguous; reconcile the queue before retrying")
+    if not matches:
+        return None
+    message = matches[0]
+    if (type(message.id) is not int or message.id <= 0 or not isinstance(message.date, datetime)
+            or message.date.tzinfo is None
+            or (photo_path is not None and (not isinstance(message.media, types.MessageMediaPhoto)
+                                            or not isinstance(message.media.photo, types.Photo)))):
+        raise TelegramResultError("Scheduled post has an invalid identity, date or expected photo")
+    scheduled_for = int(message.date.timestamp())
+    if not 0 < scheduled_for < 0x7FFFFFFE:
+        raise TelegramResultError("Scheduled post has an invalid date")
+    return {"id": message.id, "scheduled": True, "scheduled_for": scheduled_for}
 
 
 def _message_entities(text: str, documents: list[dict] | None,
@@ -377,8 +424,9 @@ class TelegramTransport:
         """Recognize server-converted images before adopting their new document IDs.
 
         Telegram converts static uploads to WebP and can change both IDs and
-        pixels. A positional match must be close in visible color, preserve alpha
-        exactly, and be clearly better than every other source. Ambiguity fails closed.
+        pixels. Compare both the original and one fixed WebP conversion model.
+        A positional match must preserve alpha and broad color/layout and be
+        clearly better than every other source. Ambiguity fails closed.
         Transport errors propagate so the caller can retry this read later.
         """
         items, documents = pack.get("items", []), remote.get("documents", [])
@@ -408,7 +456,9 @@ class TelegramTransport:
                     return _content_mismatch("invalid_local_image", position=len(sources) + 1,
                                              expected_width=100, expected_height=100, actual=_image_facts(content))
                 rgb = _visible_rgb(rgba)
-                sources.append((rgb, rgba.getchannel("A"), rgb.resize(_CONTENT_LOWPASS_SIZE, Image.Resampling.LANCZOS)))
+                sources.append((rgb, rgba.getchannel("A"),
+                                rgb.resize(_CONTENT_LOWPASS_SIZE, Image.Resampling.LANCZOS),
+                                _webp_rgb_model(rgba)))
         except (KeyError, TypeError, OSError, ValueError):
             return _content_mismatch("local_image_unavailable", position=len(sources) + 1)
         for index, location in enumerate(locations):
@@ -431,20 +481,25 @@ class TelegramTransport:
                     expected_alpha_range=expected_alpha.getextrema(), actual_alpha_range=actual_alpha.getextrema())
             rgb = _visible_rgb(actual)
             own_distance = _rgb_rmse(rgb, sources[index][0])
-            # Lossy WebP subsamples chroma: saturated fine text can lose edge
-            # colors while preserving its layout. Both scales must match; the
-            # smaller image imposes a tighter bound on broad color/layout drift.
+            model_distance = _rgb_rmse(rgb, sources[index][3])
+            selected_distance = min(own_distance, model_distance)
+            # Also compare broad color/layout against the unconverted original;
+            # a matching codec model alone cannot excuse excessive visible loss.
             lowpass_distance = _rgb_rmse(rgb.resize(_CONTENT_LOWPASS_SIZE, Image.Resampling.LANCZOS), sources[index][2])
-            others = [(_rgb_rmse(rgb, source[0]), other + 1)
+            others = [(min(_rgb_rmse(rgb, source[0]), _rgb_rmse(rgb, source[3])), other + 1)
                       for other, source in enumerate(sources) if other != index]
             nearest_distance, nearest_position = min(others) if others else (None, None)
-            minimum_other_distance = max(2 * own_distance, own_distance + 8)
+            minimum_other_distance = max(2 * selected_distance, selected_distance + 8)
             facts = {"position": index + 1, "own_distance": round(own_distance, 4),
                      "nearest_other_distance": round(nearest_distance, 4) if nearest_distance is not None else None,
                      "nearest_other_position": nearest_position, "maximum_own_distance": _CONTENT_RMSE_LIMIT,
+                     "model_distance": round(model_distance, 4),
+                     "maximum_model_distance": _CONTENT_RMSE_LIMIT,
+                     "selected_distance": round(selected_distance, 4),
+                     "maximum_selected_distance": _CONTENT_RMSE_LIMIT,
                      "lowpass_distance": round(lowpass_distance, 4), "maximum_lowpass_distance": _CONTENT_LOWPASS_LIMIT,
                      "minimum_other_distance": round(minimum_other_distance, 4)}
-            if own_distance > _CONTENT_RMSE_LIMIT:
+            if selected_distance > _CONTENT_RMSE_LIMIT:
                 return _content_mismatch("color_distance", **facts)
             if lowpass_distance > _CONTENT_LOWPASS_LIMIT:
                 return _content_mismatch("lowpass_distance", **facts)
@@ -477,8 +532,7 @@ class TelegramTransport:
         remote = _set_record(result)
         matches = [item for item in remote["documents"] if item["id"] == int(document["id"])]
         if (not remote["creator"] or not remote["emojis"] or len(matches) != 1
-                or sorted(word.casefold() for word in matches[0]["keywords"])
-                != sorted(word.casefold() for word in expected)):
+                or canonical_keywords(matches[0]["keywords"]) != canonical_keywords(expected)):
             raise TelegramResultError("Updated custom emoji keywords could not be verified")
         return remote
 
@@ -487,47 +541,82 @@ class TelegramTransport:
             stickerset=types.InputStickerSetShortName(short_name=short_name),
             thumb_document_id=document_id))
 
-    async def find_post(self, channel: dict, text: str) -> dict | None:
+    async def find_post(self, channel: dict, text: str, *,
+                        photo_path: str | Path | None = None) -> dict | None:
         async for message in self.client.iter_messages(_input_peer(channel), limit=100):
             if _matches_post(message, channel, text):
+                if photo_path is not None and (not isinstance(message.media, types.MessageMediaPhoto)
+                                                or not isinstance(message.media.photo, types.Photo)):
+                    raise TelegramResultError("Matching published caption is missing its expected photo")
                 return _post_record(channel, message.id)
         return None
+
+    async def find_scheduled_post(self, channel: dict, text: str, *,
+                                  photo_path: str | Path | None = None) -> dict | None:
+        result = await self.client(functions.messages.GetScheduledHistoryRequest(
+            peer=_input_peer(channel), hash=0))
+        messages = getattr(result, "messages", None)
+        if not isinstance(messages, list):
+            raise TelegramResultError("Telegram did not return the scheduled-message queue")
+        return _scheduled_post_record(messages, channel, text, photo_path)
 
     async def send_post(self, channel: dict, text: str, random_id: int,
                         emoji_documents: list[dict] | None = None,
                         links: list[dict] | None = None,
                         photo_path: str | Path | None = None, *,
-                        formatting: list[dict] | None = None) -> dict:
+                        formatting: list[dict] | None = None,
+                        schedule_at: int | None = None) -> dict:
         if not isinstance(random_id, int) or isinstance(random_id, bool) or not -(2**63) <= random_id < 2**63 or random_id == 0:
             raise ValueError("A persistent non-zero signed 64-bit random_id is required")
+        if schedule_at is not None and (type(schedule_at) is not int or not 0 < schedule_at < 0x7FFFFFFE):
+            raise ValueError("schedule_at must be a positive ordinary UTC Unix timestamp")
+        schedule_date = datetime.fromtimestamp(schedule_at, timezone.utc) if schedule_at is not None else None
         entities = _message_entities(text, emoji_documents, links, formatting)
         if photo_path is not None:
             photo = _validate_photo(photo_path, text, self._max_caption_length)
             file = await self.client.upload_file(str(photo))
             request = functions.messages.SendMediaRequest(
                 peer=_input_peer(channel), media=types.InputMediaUploadedPhoto(file=file),
-                message=text, random_id=random_id, entities=entities or None)
+                message=text, random_id=random_id, entities=entities or None, schedule_date=schedule_date)
         else:
             request = functions.messages.SendMessageRequest(
                 peer=_input_peer(channel), message=text, random_id=random_id, no_webpage=True,
-                entities=entities or None)
+                entities=entities or None, schedule_date=schedule_date)
         try:
             result = await self.client(request)
         except errors.RandomIdDuplicateError:
-            found = await self.find_post(channel, text)
+            if schedule_at is not None:
+                found = await self.find_scheduled_post(channel, text, photo_path=photo_path)
+                if found:
+                    return found
+            found = await self.find_post(channel, text, **({"photo_path": photo_path} if schedule_at is not None else {}))
             if found:
                 return found
             raise
-        if isinstance(result, types.UpdateShortSentMessage):
+        if schedule_at is None and isinstance(result, types.UpdateShortSentMessage):
             return _post_record(channel, result.id)
         updates = getattr(result, "updates", [])
+        if schedule_at is not None:
+            scheduled = _scheduled_post_record(
+                [update.message for update in updates if isinstance(update, types.UpdateNewScheduledMessage)],
+                channel, text, photo_path)
+            if scheduled:
+                return scheduled
         for update in updates:
-            if isinstance(update, types.UpdateMessageID) and update.random_id == random_id:
+            if schedule_at is None and isinstance(update, types.UpdateMessageID) and update.random_id == random_id:
                 return _post_record(channel, update.id)
         for update in updates:
             if isinstance(update, types.UpdateNewChannelMessage) and _matches_post(update.message, channel, text):
+                if schedule_at is not None and photo_path is not None and (
+                        not isinstance(update.message.media, types.MessageMediaPhoto)
+                        or not isinstance(update.message.media.photo, types.Photo)):
+                    raise TelegramResultError("Immediately published scheduled caption is missing its expected photo")
                 return _post_record(channel, update.message.id)
-        found = await self.find_post(channel, text)
+        if schedule_at is not None:
+            found = await self.find_scheduled_post(channel, text, photo_path=photo_path)
+            if found:
+                return found
+        found = await self.find_post(channel, text, **({"photo_path": photo_path} if schedule_at is not None else {}))
         if found:
             return found
         raise TelegramResultError("Post may have been sent; keep its random_id and reconcile before retrying")

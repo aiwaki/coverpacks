@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import time
 
@@ -96,6 +97,19 @@ def _ready_count(state, task_id, document, capacity):
     return ready
 
 
+def preparation_due_at(ledger, settings):
+    """Open a bounded preparation window before a server-scheduled release."""
+    ahead = settings.get("schedule_ahead_seconds", 0)
+    if type(ahead) is not int or not 0 <= ahead <= 86400:
+        raise ValueError("Schedule preparation window must be 0..86400 seconds")
+    due = ledger.get("daily_next_due_at")
+    if due is None:
+        return 0
+    if type(due) not in {int, float} or not math.isfinite(due) or due < 0:
+        raise ValueError("Invalid daily publication timestamp")
+    return due - ahead
+
+
 async def run_daily(state, ledger, config, settings, transport_factory, checkpoint, *, now=time.time,
                     collector_factory=None):
     task_id, prefix = settings["task_id"], settings["prefix"]
@@ -103,7 +117,8 @@ async def run_daily(state, ledger, config, settings, transport_factory, checkpoi
     if type(capacity) is not int or not 1 <= capacity <= 200:
         raise ValueError("Daily pack capacity must be 1..200")
     active = ledger.get("daily_active_pack")
-    if not active and now() < (ledger.get("daily_next_due_at") or 0):
+    ready_at = preparation_due_at(ledger, settings)
+    if not active and now() < ready_at:
         return {"status": "not_due", "next_due_at": ledger.get("daily_next_due_at")}
     manifest = manifest_path(state.root, prefix)
     document = json.loads(manifest.read_bytes())
@@ -170,6 +185,7 @@ async def run_daily(state, ledger, config, settings, transport_factory, checkpoi
     verify_selection(state, selected_document)
     async with transport_factory() as transport:
         result = await Publisher(ledger, transport, now=now, checkpoint=checkpoint).publish_next(
-            manifest, config, interval_seconds=settings.get("interval_seconds", 86400))
+            manifest, config, interval_seconds=settings.get("interval_seconds", 86400),
+            schedule_ahead_seconds=settings.get("schedule_ahead_seconds", 0))
     await checkpoint()
     return result

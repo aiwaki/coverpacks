@@ -137,6 +137,36 @@ def test_not_due_opens_no_transport_collector_or_checkpoint(case):
     assert case.transport.events == []
 
 
+@pytest.mark.parametrize("ahead", [-1, 86401, True, None, "3600", 0.5])
+def test_invalid_preparation_window_fails_before_external_work(case, ahead):
+    case.settings["schedule_ahead_seconds"] = ahead
+    with pytest.raises(ValueError, match="preparation window"):
+        run(case)
+    assert case.transport_opens == case.collector_opens == case.checkpoints == 0
+
+
+def test_future_release_does_not_collect_before_preparation_window(case):
+    case.settings["schedule_ahead_seconds"] = 3600
+    case.ledger.put("daily_next_due_at", case.timestamp + 3601)
+    assert run(case)["status"] == "not_due"
+    assert case.transport_opens == case.collector_opens == case.checkpoints == 0
+
+
+def test_preparation_opens_at_boundary_and_passes_scheduling_mode(case, monkeypatch):
+    case.settings["schedule_ahead_seconds"] = 3600
+    case.ledger.put("daily_next_due_at", case.timestamp + 3600)
+    calls = []
+
+    async def scheduled(self, manifest, config, *, interval_seconds, schedule_ahead_seconds):
+        calls.append((interval_seconds, schedule_ahead_seconds))
+        return {"status": "scheduled", "scheduled_for": 4600}
+
+    monkeypatch.setattr(Publisher, "publish_next", scheduled)
+    assert run(case) == {"status": "scheduled", "scheduled_for": 4600}
+    assert calls == [(86400, 3600)]
+    assert len(case.collector.run_calls) == 1 and case.transport_opens == 1
+
+
 @pytest.mark.parametrize("failure_point", ["after_head_checkpoint", "during_collection"])
 def test_resumed_cycle_does_not_repeat_head_or_increase_target(case, failure_point):
     if failure_point == "after_head_checkpoint":

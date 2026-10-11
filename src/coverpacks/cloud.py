@@ -15,7 +15,7 @@ from telethon.sessions import StringSession
 
 from .bandcamp import BandcampAPI
 from .cloud_store import CloudArchive, CloudStateError, GitHubStore
-from .daily import manifest_path, needed_media, run_daily
+from .daily import manifest_path, needed_media, preparation_due_at, run_daily
 from .network import Network
 from .publisher import PublicationState
 from .state import State, collection_lock
@@ -112,7 +112,8 @@ async def execute(args):
                 return
             # Most scheduled checks need no network/asset transfer at all.
             import time
-            if not ledger.get("daily_active_pack") and time.time() < (ledger.get("daily_next_due_at") or 0):
+            ready_at = preparation_due_at(ledger, settings)
+            if not ledger.get("daily_active_pack") and time.time() < ready_at:
                 print(json.dumps({"status": "not_due", "next_due_at": ledger.get("daily_next_due_at")}))
                 return
             archive.hydrate(needed_media(state, ledger, config))

@@ -7,11 +7,13 @@ from io import BytesIO
 import json
 from types import SimpleNamespace
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 import pytest
 from telethon import errors, functions, types
 
-from coverpacks.telegram_transport import TelegramResultError, TelegramTransport, _rgb_rmse, _visible_rgb
+from coverpacks.telegram_transport import (
+    TelegramResultError, TelegramTransport, _rgb_rmse, _visible_rgb, canonical_keywords,
+)
 
 
 NOW = datetime(2026, 10, 6, tzinfo=timezone.utc)
@@ -114,6 +116,19 @@ def emoji_bytes(color=(80, 90, 100, 255), *, size=(100, 100), format="WEBP", **o
     return buffer.getvalue()
 
 
+def webp_bytes(image, *, lossless=False):
+    buffer = BytesIO()
+    image.save(buffer, "WEBP", lossless=lossless, quality=85, method=4)
+    return buffer.getvalue()
+
+
+def chroma_checkerboard(period, *, colors=((255, 0, 0), (0, 255, 255))):
+    image = Image.new("RGBA", (100, 100))
+    image.putdata([colors[(x // period + y // period) % 2] + (255,)
+                   for y in range(100) for x in range(100)])
+    return image
+
+
 def content_verification_pack(tmp_path, contents):
     items, documents = [], []
     for index, content in enumerate(contents):
@@ -201,27 +216,36 @@ def test_verify_content_hidden_rgb_cannot_disambiguate_visually_identical_source
 
 @pytest.mark.parametrize("failure", ["color_distance", "lowpass_distance", "ambiguous_source", "alpha_mismatch", "invalid_remote_image"])
 def test_verification_diagnostics_are_structured_and_exclude_private_references(tmp_path, caplog, failure):
-    other = 125 if failure == "ambiguous_source" else 150
+    other = 104 if failure == "ambiguous_source" else 150
     contents = [emoji_bytes((100, 100, 100, 255)), emoji_bytes((other, other, other, 255))]
     remote, pack = content_verification_pack(tmp_path, contents)
     remote["documents"][0].update(id=987654321001, access_hash=987654321002, file_reference="736563726574726566")
     payload = {
         "color_distance": emoji_bytes((135, 135, 135, 255)),
         "lowpass_distance": emoji_bytes((113, 113, 113, 255)),
-        "ambiguous_source": emoji_bytes((110, 110, 110, 255)),
+        "ambiguous_source": contents[0],
         "alpha_mismatch": emoji_bytes((100, 100, 100, 254)),
         "invalid_remote_image": emoji_bytes(size=(512, 512)),
     }[failure]
+    if failure == "lowpass_distance":
+        source = chroma_checkerboard(3)
+        payload = webp_bytes(source)
+        remote, pack = content_verification_pack(tmp_path, [webp_bytes(source, lossless=True), contents[1]])
     assert run(TelegramTransport(DownloadClient([payload])).verify_set_content(remote, pack)) is False
     record = json.loads(caplog.records[-1].getMessage())
     assert record["event"] == "emoji_content_verification_failed"
     assert record["reason"] == failure and record["position"] == 1
     if failure in {"color_distance", "lowpass_distance", "ambiguous_source"}:
         assert record["nearest_other_position"] == 2
-        distance = {"color_distance": 35, "lowpass_distance": 13, "ambiguous_source": 10}[failure]
-        assert record["own_distance"] == record["lowpass_distance"] == distance
-        assert record["nearest_other_distance"] == other - 100 - distance
-        assert record["maximum_own_distance"] == 32 and record["maximum_lowpass_distance"] == 12
+        if failure == "lowpass_distance":
+            assert record["model_distance"] == record["selected_distance"] == 0
+            assert record["lowpass_distance"] > 12
+        else:
+            distance = {"color_distance": 35, "ambiguous_source": 0}[failure]
+            assert record["own_distance"] == record["lowpass_distance"] == distance
+            assert record["nearest_other_distance"] == other - 100 - distance
+        assert record["maximum_own_distance"] == record["maximum_model_distance"] == 4
+        assert record["maximum_lowpass_distance"] == 12
     elif failure == "alpha_mismatch":
         assert record["mismatch_pixels"] == 10000 and record["maximum_alpha_difference"] == 1
     else:
@@ -231,15 +255,15 @@ def test_verification_diagnostics_are_structured_and_exclude_private_references(
         assert private not in caplog.text
 
 
-@pytest.mark.parametrize("distance,expected", [(12, True), (13, False)])
-def test_verify_content_has_stricter_lowpass_bound_for_broad_color_changes(tmp_path, distance, expected):
+@pytest.mark.parametrize("distance,expected", [(4, True), (5, False), (12, False)])
+def test_verify_content_bounds_broad_color_changes_against_plausible_encodings(tmp_path, distance, expected):
     remote, pack = content_verification_pack(tmp_path, [emoji_bytes((100, 100, 100, 255))])
     client = DownloadClient([emoji_bytes((100 + distance,) * 3 + (255,))])
     assert run(TelegramTransport(client).verify_set_content(remote, pack)) is expected
 
 
-@pytest.mark.parametrize("distance,expected", [(32, True), (33, False)])
-def test_verify_content_full_resolution_bound_remains_required_when_lowpass_matches(tmp_path, distance, expected):
+@pytest.mark.parametrize("distance,expected", [(4, True), (5, False), (32, False), (33, False)])
+def test_verify_content_rejects_added_fine_noise_even_when_lowpass_matches(tmp_path, distance, expected):
     remote, pack = content_verification_pack(tmp_path, [emoji_bytes((100, 100, 100, 255))])
     converted = Image.new("RGB", (100, 100))
     converted.putdata([(100 + (distance if (x + y) % 2 else -distance),) * 3
@@ -247,6 +271,59 @@ def test_verify_content_full_resolution_bound_remains_required_when_lowpass_matc
     buffer = BytesIO()
     converted.save(buffer, "WEBP", lossless=True)
     assert run(TelegramTransport(DownloadClient([buffer.getvalue()])).verify_set_content(remote, pack)) is expected
+
+
+@pytest.mark.parametrize("period,expected", [(2, True), (3, False)])
+def test_verify_content_keeps_original_lowpass_gate_even_for_exact_codec_model(tmp_path, period, expected):
+    source = chroma_checkerboard(period)
+    remote, pack = content_verification_pack(tmp_path, [webp_bytes(source, lossless=True)])
+    assert run(TelegramTransport(DownloadClient([webp_bytes(source)])).verify_set_content(remote, pack)) is expected
+
+
+def test_verify_content_accepts_modeled_chroma_loss_without_raw_threshold_or_margin_ratchet(tmp_path):
+    source = chroma_checkerboard(1, colors=((0, 0, 255), (255, 255, 0)))
+    converted = webp_bytes(source)
+    actual_rgb = _visible_rgb(Image.open(BytesIO(converted)).convert("RGBA"))
+    source_rgb = _visible_rgb(source)
+    other = Image.new("RGBA", (100, 100), (128, 128, 128, 255))
+    own_distance = _rgb_rmse(actual_rgb, source_rgb)
+    assert own_distance > 32
+    assert _rgb_rmse(actual_rgb, _visible_rgb(other)) < 2 * own_distance
+    originals = [webp_bytes(source, lossless=True), webp_bytes(other, lossless=True)]
+    remote, pack = content_verification_pack(tmp_path, originals)
+    assert run(TelegramTransport(DownloadClient([converted, originals[1]])).verify_set_content(remote, pack)) is True
+
+
+@pytest.mark.parametrize("change", ["wrong_art", "blur", "dark", "rotate"])
+def test_verify_content_codec_model_does_not_explain_unrelated_transformations(tmp_path, change):
+    source = chroma_checkerboard(8, colors=((0, 0, 255), (255, 255, 0)))
+    ImageDraw.Draw(source).rectangle((5, 7, 33, 20), fill=(0, 0, 0, 255))
+    modified = {
+        "wrong_art": Image.new("RGBA", source.size, (60, 100, 180, 255)),
+        "blur": source.filter(ImageFilter.GaussianBlur(2)),
+        "dark": ImageEnhance.Brightness(source).enhance(0.6),
+        "rotate": source.transpose(Image.Transpose.ROTATE_180),
+    }[change]
+    remote, pack = content_verification_pack(tmp_path, [webp_bytes(source, lossless=True)])
+    assert run(TelegramTransport(DownloadClient([webp_bytes(modified)])).verify_set_content(remote, pack)) is False
+
+
+def test_verify_content_rejects_different_sources_collapsing_to_identical_codec_output(tmp_path):
+    colors = ((255, 0, 0), (0, 130, 0))  # Different colors, almost equal luminance.
+    sources = [chroma_checkerboard(1, colors=colors), chroma_checkerboard(1, colors=colors[::-1])]
+    originals = [webp_bytes(source, lossless=True) for source in sources]
+    converted = [webp_bytes(source) for source in sources]
+    assert originals[0] != originals[1]
+    assert _rgb_rmse(*[_visible_rgb(Image.open(BytesIO(content)).convert("RGBA")) for content in converted]) < 4
+    remote, pack = content_verification_pack(tmp_path, originals)
+    assert run(TelegramTransport(DownloadClient(converted)).verify_set_content(remote, pack)) is False
+
+
+def test_verify_content_rejects_swapped_server_conversions(tmp_path):
+    sources = [chroma_checkerboard(8), chroma_checkerboard(12, colors=((0, 0, 255), (255, 255, 0)))]
+    remote, pack = content_verification_pack(tmp_path, [webp_bytes(source, lossless=True) for source in sources])
+    converted = [webp_bytes(source) for source in sources[::-1]]
+    assert run(TelegramTransport(DownloadClient(converted)).verify_set_content(remote, pack)) is False
 
 
 def test_verify_content_accepts_chroma_loss_in_saturated_text_but_rejects_wrong_layout(tmp_path):
@@ -624,6 +701,157 @@ def photo_media():
         id=91, access_hash=92, file_reference=b"ref", date=NOW, sizes=[], dc_id=2))
 
 
+SCHEDULE_AT = int(NOW.timestamp()) + 86400
+
+
+def scheduled_message(text="post", **changes):
+    return message(text, **({"id": 8, "date": datetime.fromtimestamp(SCHEDULE_AT, timezone.utc),
+                            "post": False} | changes))
+
+
+@pytest.mark.parametrize("with_photo", [False, True])
+def test_schedule_post_uses_native_queue_ids_without_public_links(tmp_path, with_photo):
+    path = photo_file(tmp_path) if with_photo else None
+    text = "💿 Album"
+    pending = scheduled_message(text, media=photo_media() if with_photo else None)
+    client = FakeClient([SimpleNamespace(updates=[
+        types.UpdateMessageID(id=999, random_id=1234),
+        types.UpdateNewScheduledMessage(message=pending),
+    ])])
+    result = run(TelegramTransport(client).send_post(
+        CHANNEL, text, 1234, [DOCUMENT | {"alt": "💿"}],
+        [{"offset": 3, "length": 5, "url": "https://artist.bandcamp.com/album/title"}], path,
+        formatting=[{"type": "bold", "offset": 3, "length": 5}], schedule_at=SCHEDULE_AT))
+    assert result == {"id": 8, "scheduled": True, "scheduled_for": SCHEDULE_AT}
+    request, = client.calls
+    assert isinstance(request, functions.messages.SendMediaRequest if with_photo else functions.messages.SendMessageRequest)
+    assert request.schedule_date == datetime.fromtimestamp(SCHEDULE_AT, timezone.utc)
+    assert request.random_id == 1234 and request.message == text
+    assert len(request.entities) == 3
+    assert [(entity.offset, entity.length) for entity in request.entities] == [(0, 2), (3, 5), (3, 5)]
+    assert not client.iter_message_calls
+
+
+@pytest.mark.parametrize("response", [
+    errors.RandomIdDuplicateError(request=None),
+    SimpleNamespace(updates=[]),
+    SimpleNamespace(updates=[types.UpdateMessageID(id=999, random_id=1234)]),
+])
+def test_scheduled_missing_ack_reconciles_queue_without_resending(tmp_path, response):
+    client = FakeClient([response, SimpleNamespace(messages=[scheduled_message(media=photo_media())])])
+    result = run(TelegramTransport(client).send_post(
+        CHANNEL, "post", 1234, photo_path=photo_file(tmp_path), schedule_at=SCHEDULE_AT))
+    assert result == {"id": 8, "scheduled": True, "scheduled_for": SCHEDULE_AT}
+    assert len(client.uploads) == 1 and len(client.calls) == 2
+    assert isinstance(client.calls[1], functions.messages.GetScheduledHistoryRequest)
+    assert client.calls[1].hash == 0 and client.calls[1].peer.channel_id == CHANNEL["id"]
+    assert not client.iter_message_calls
+
+
+def test_find_scheduled_post_requires_unique_exact_channel_caption_and_expected_photo():
+    client = FakeClient([SimpleNamespace(messages=[
+        scheduled_message("post suffix"), scheduled_message(peer_id=types.PeerChannel(999)),
+        scheduled_message(peer_id=types.PeerUser(123)), types.MessageEmpty(id=2, peer_id=types.PeerChannel(123)),
+        scheduled_message(media=photo_media()),
+    ])])
+    result = run(TelegramTransport(client).find_scheduled_post(CHANNEL, "post", photo_path="expected.png"))
+    assert result == {"id": 8, "scheduled": True, "scheduled_for": SCHEDULE_AT}
+    assert not client.uploads and not client.iter_message_calls
+
+
+def test_duplicate_scheduled_captions_fail_closed_instead_of_picking_one():
+    client = FakeClient([SimpleNamespace(messages=[scheduled_message(), scheduled_message(id=9)])])
+    with pytest.raises(TelegramResultError, match="ambiguous"):
+        run(TelegramTransport(client).find_scheduled_post(CHANNEL, "post"))
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("changes", [{"id": 0}, {"date": None},
+    {"date": NOW.replace(tzinfo=None)}, {"date": datetime.fromtimestamp(0, timezone.utc)},
+    {"media": None}, {"media": types.MessageMediaPhoto(photo=types.PhotoEmpty(id=1))}])
+def test_invalid_scheduled_record_stops_reconciliation(changes):
+    pending = scheduled_message(**({"media": photo_media()} | changes))
+    client = FakeClient([SimpleNamespace(messages=[pending])])
+    with pytest.raises(TelegramResultError, match="invalid"):
+        run(TelegramTransport(client).find_scheduled_post(CHANNEL, "post", photo_path="expected.png"))
+
+
+def test_missing_scheduled_queue_response_is_not_treated_as_empty():
+    client = FakeClient([SimpleNamespace()])
+    with pytest.raises(TelegramResultError, match="queue"):
+        run(TelegramTransport(client).find_scheduled_post(CHANNEL, "post"))
+
+
+@pytest.mark.parametrize("response", [errors.RandomIdDuplicateError(request=None), SimpleNamespace(updates=[])])
+def test_scheduled_send_reconciles_delivered_post_after_queue_is_flushed(tmp_path, response):
+    client = FakeClient([response, SimpleNamespace(messages=[])], messages=[message(media=photo_media())])
+    result = run(TelegramTransport(client).send_post(
+        CHANNEL, "post", 1234, photo_path=photo_file(tmp_path), schedule_at=SCHEDULE_AT))
+    assert result == {"id": 42, "link": "https://t.me/sleeve_test/42"}
+    assert len(client.calls) == 2 and len(client.uploads) == 1
+
+
+@pytest.mark.parametrize("response,error", [
+    (errors.RandomIdDuplicateError(request=None), errors.RandomIdDuplicateError),
+    (SimpleNamespace(updates=[]), TelegramResultError),
+])
+def test_scheduled_send_missing_from_both_histories_stops_without_repeating(response, error):
+    client = FakeClient([response, SimpleNamespace(messages=[])])
+    with pytest.raises(error):
+        run(TelegramTransport(client).send_post(CHANNEL, "post", 1234, schedule_at=SCHEDULE_AT))
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize("short_result", [False, True])
+def test_schedule_in_past_can_return_an_immediately_delivered_post(tmp_path, short_result):
+    result = (types.UpdateShortSentMessage(id=42, pts=1, pts_count=1, date=NOW, media=photo_media())
+              if short_result else SimpleNamespace(updates=[
+                  types.UpdateMessageID(id=999, random_id=1234),
+                  types.UpdateNewChannelMessage(message(media=photo_media()), pts=1, pts_count=1)]))
+    client = FakeClient([result] + ([SimpleNamespace(messages=[])] if short_result else []),
+                        messages=[message(media=photo_media())])
+    assert run(TelegramTransport(client).send_post(
+        CHANNEL, "post", 1234, photo_path=photo_file(tmp_path), schedule_at=1)) == {
+            "id": 42, "link": "https://t.me/sleeve_test/42"}
+    assert len(client.calls) == (2 if short_result else 1)
+    assert client.calls[0].schedule_date == datetime.fromtimestamp(1, timezone.utc)
+
+
+def test_scheduled_short_ack_is_reconciled_before_treating_its_id_as_public():
+    client = FakeClient([
+        types.UpdateShortSentMessage(id=999, pts=1, pts_count=1, date=NOW),
+        SimpleNamespace(messages=[scheduled_message()]),
+    ])
+    result = run(TelegramTransport(client).send_post(CHANNEL, "post", 1234, schedule_at=SCHEDULE_AT))
+    assert result == {"id": 8, "scheduled": True, "scheduled_for": SCHEDULE_AT}
+    assert len(client.calls) == 2 and not client.iter_message_calls
+
+
+@pytest.mark.parametrize("schedule_at", [True, 0, -1, 1.5, "1000", 0x7FFFFFFE, 2**31])
+def test_invalid_schedule_time_stops_before_upload_or_send(tmp_path, schedule_at):
+    client = FakeClient()
+    with pytest.raises(ValueError, match="schedule_at"):
+        run(TelegramTransport(client).send_post(
+            CHANNEL, "post", 1234, photo_path=photo_file(tmp_path), schedule_at=schedule_at))
+    assert not client.calls and not client.uploads
+
+
+@pytest.mark.parametrize("error", [errors.FloodWaitError(request=None, capture=30), ConnectionError("temporary")])
+def test_scheduled_queue_read_errors_propagate_without_repeat(error):
+    client = FakeClient([error])
+    with pytest.raises(type(error)):
+        run(TelegramTransport(client).find_scheduled_post(CHANNEL, "post"))
+    assert len(client.calls) == 1
+
+
+def test_scheduled_photo_cannot_be_reconciled_to_a_text_only_published_caption(tmp_path):
+    client = FakeClient([SimpleNamespace(updates=[]), SimpleNamespace(messages=[])], messages=[message()])
+    with pytest.raises(TelegramResultError, match="photo"):
+        run(TelegramTransport(client).send_post(
+            CHANNEL, "post", 1234, photo_path=photo_file(tmp_path), schedule_at=SCHEDULE_AT))
+    assert len(client.calls) == 2 and len(client.uploads) == 1
+
+
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
 def test_send_photo_preserves_random_id_caption_and_entities(tmp_path, format):
     path = photo_file(tmp_path, format=format)
@@ -863,7 +1091,10 @@ def test_get_set_maps_keywords_by_document_id_not_returned_order():
     assert [item["keywords"] for item in remote["documents"]] == [["Original"], ["Second", "Другой"]]
 
 
-@pytest.mark.parametrize("value,returned", [("Album title,Artist", ["artist", "album title"]), ("", [])])
+@pytest.mark.parametrize("value,returned", [
+    ("Album title,Artist", ["artist", "album title"]), ("", []),
+    ("Lego Pirates: 1989-1996,Dreamcastle™", ["lego pirates: 1989-1996", "dreamcastle"]),
+])
 def test_change_keywords_preserves_art_and_emoji_and_verifies_reply(value, returned):
     client = FakeClient([keyword_set(returned)])
     remote = run(TelegramTransport(client).change_keywords(DOCUMENT, value))
@@ -874,6 +1105,27 @@ def test_change_keywords_preserves_art_and_emoji_and_verifies_reply(value, retur
     assert request.keywords == value
     assert int.from_bytes(bytes(request)[4:8], "little") & 4  # Empty string also explicitly clears keywords.
     assert remote["documents"][0]["keywords"] == returned
+
+
+@pytest.mark.parametrize("expected,actual", [
+    (["Album: 1989-1996", "Dreamcastle™"], ["album 1989-1996", "dreamcastle"]),
+    (["Café", "Dreamcastle™"], ["cafe", "dreamcastle"]),
+    (["Album", "Dreamcastle™"], ["album", "different artist"]),
+    (["Album", "Dreamcastle™"], ["dreamcastle"]),
+    (["Album", "Dreamcastle™"], ["album", "album", "dreamcastle"]),
+    (["™"], []),
+])
+def test_keyword_compatibility_keeps_all_other_content_and_phrase_counts_strict(expected, actual):
+    assert canonical_keywords(expected) != canonical_keywords(actual)
+    client = FakeClient([keyword_set(actual)])
+    with pytest.raises(TelegramResultError, match="keywords"):
+        run(TelegramTransport(client).change_keywords(DOCUMENT, ",".join(expected)))
+
+
+def test_keyword_compatibility_does_not_mutate_inputs_or_guess_empty_phrase_removal():
+    original = ["Dreamcastle™", "Lego Pirates: 1989-1996", "™"]
+    assert canonical_keywords(original) == ["", "dreamcastle", "lego pirates: 1989-1996"]
+    assert original == ["Dreamcastle™", "Lego Pirates: 1989-1996", "™"]
 
 
 @pytest.mark.parametrize("value", ["x" * 65, "💿" * 33, ",".join(str(i) for i in range(21)),

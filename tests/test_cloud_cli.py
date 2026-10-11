@@ -20,7 +20,7 @@ def case(tmp_path, monkeypatch):
     root = tmp_path / "data"
     events = []
     case = SimpleNamespace(root=root, events=events, next_due_at=None, account_id=123,
-                           channel_valid=True, set_exists=True, checkpoints=[])
+                           channel_valid=True, set_exists=True, checkpoints=[], schedule_ahead_seconds=0)
     monkeypatch.setenv("GH_TOKEN", "test-github-token")
     monkeypatch.setenv("COVERPACKS_TELEGRAM", "deliberately invalid test secret")
 
@@ -43,7 +43,8 @@ def case(tmp_path, monkeypatch):
                 ledger.db.execute("INSERT INTO packs(number,short_name,pack_hash,payload,status) VALUES(1,?,?,?,'published')",
                                   ("sleeve_test_001", "0" * 64, "{}"))
             ledger.close()
-            (root / "daily.json").write_text(json.dumps({"prefix": "sleeve_vinyl", "task_id": 1}))
+            (root / "daily.json").write_text(json.dumps({"prefix": "sleeve_vinyl", "task_id": 1,
+                "schedule_ahead_seconds": case.schedule_ahead_seconds}))
             (root / "telegram/channel.json").write_text(json.dumps(config))
             directory = root / "emoji/sleeve_vinyl"
             directory.mkdir(parents=True)
@@ -117,6 +118,22 @@ def test_not_due_run_does_not_hydrate_connect_or_checkpoint(case, capsys):
     execute(case, "run")
     assert case.events == ["restore"]
     assert json.loads(capsys.readouterr().out) == {"status": "not_due", "next_due_at": 2**40}
+
+
+def test_cloud_enters_preparation_window_before_delivery_time(case, monkeypatch, capsys):
+    import time
+    case.next_due_at = time.time() + 3600
+    case.schedule_ahead_seconds = 7200
+    monkeypatch.setattr(cloud, "needed_media", lambda *args: set())
+    calls = []
+
+    async def daily(state, ledger, config, settings, factory, checkpoint):
+        calls.append(settings["schedule_ahead_seconds"])
+        return {"status": "scheduled"}
+
+    monkeypatch.setattr(cloud, "run_daily", daily)
+    execute(case, "run")
+    assert calls == [7200] and json.loads(capsys.readouterr().out)["status"] == "scheduled"
 
 
 def test_verify_only_checks_account_channel_and_existing_set(case, capsys):

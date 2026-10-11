@@ -20,6 +20,11 @@ from PIL import Image
 from telethon import errors
 
 from .state import collection_lock
+from .telegram_transport import canonical_keywords
+
+
+_SCHEDULE_PREPARATION_SECONDS = 15 * 60
+_SCHEDULE_SEND_MARGIN_SECONDS = 60
 
 
 class PublicationError(ValueError):
@@ -245,6 +250,9 @@ class PublicationState:
                 self.db.execute(f"ALTER TABLE posts ADD COLUMN {column} TEXT")
         if "formatting" not in columns:
             self.db.execute("ALTER TABLE posts ADD COLUMN formatting TEXT NOT NULL DEFAULT '[]'")
+        for column in ("schedule_at", "scheduled_message_id"):
+            if column not in columns:
+                self.db.execute(f"ALTER TABLE posts ADD COLUMN {column} INTEGER")
         self.db.commit()
         for file in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
             if file.exists():
@@ -294,6 +302,9 @@ class Publisher:
             # The callback must durably save the existing local intent before
             # the request can become visible outside this process.
             await self._checkpoint()
+        if (operation.startswith("send_post:") and kwargs.get("schedule_at") is not None
+                and kwargs["schedule_at"] <= self.now() + _SCHEDULE_SEND_MARGIN_SECONDS):
+            raise ReconciliationRequired("Закреплённое время публикации слишком близко после сохранения checkpoint. Немедленная отправка отключена.")
         try:
             return await method(*args, **kwargs)
         except errors.FloodWaitError as error:
@@ -319,6 +330,8 @@ class Publisher:
             for pack in document["packs"]:
                 await self._pack(channel, pack, bool(account.get("premium")), document["brand"],
                                  capabilities["max_caption_length"])
+                if self.state.db.execute("SELECT status FROM packs WHERE short_name=?", (pack["short_name"],)).fetchone()[0] != "published":
+                    break
             return self.state.report()
 
     async def _publication_context(self, document, config):
@@ -367,7 +380,8 @@ class Publisher:
                 )])
         return self._daily_result("published", active["short_name"])
 
-    async def publish_next(self, manifest_path: Path, config: dict, *, interval_seconds=86400):
+    async def publish_next(self, manifest_path: Path, config: dict, *, interval_seconds=86400,
+                           schedule_ahead_seconds=0):
         """Publish at most one queued pack, resuming its durable intent first.
 
         New intents retain the due-time anchor across retries. Completion moves
@@ -378,6 +392,8 @@ class Publisher:
         """
         if type(interval_seconds) is not int or interval_seconds <= 0:
             raise PublicationError("Интервал публикации должен быть положительным целым числом секунд.")
+        if type(schedule_ahead_seconds) is not int or not 0 <= schedule_ahead_seconds <= 86400:
+            raise PublicationError("schedule_ahead_seconds должен быть целым числом от 0 до 86400.")
         with collection_lock(self.state.path.parent):
             active = self.state.get("daily_active_pack")
             if active is not None:
@@ -389,7 +405,10 @@ class Publisher:
                         or type(active.get("interval_seconds")) is not int or active["interval_seconds"] <= 0
                         or ("scheduled_for" in active and
                             (type(active["scheduled_for"]) not in {int, float}
-                             or not math.isfinite(active["scheduled_for"]) or active["scheduled_for"] < 0))):
+                             or not math.isfinite(active["scheduled_for"]) or active["scheduled_for"] < 0))
+                        or ("delivery_at" in active and
+                            (type(active["delivery_at"]) is not int or active["delivery_at"] <= 0
+                             or "scheduled_for" not in active))):
                     raise ReconciliationRequired("Повреждён checkpoint ежедневной публикации.")
                 manifest_path = Path(active["manifest_path"])
             else:
@@ -417,7 +436,7 @@ class Publisher:
                 if next_due is not None:
                     if type(next_due) not in {int, float} or not math.isfinite(next_due) or next_due < 0:
                         raise ReconciliationRequired("Повреждено время следующей ежедневной публикации.")
-                    if self.now() < next_due:
+                    if self.now() < next_due - schedule_ahead_seconds:
                         return self._daily_result("not_due")
                 row = self.state.db.execute("SELECT * FROM packs WHERE status!='published' ORDER BY number LIMIT 1").fetchone()
                 if row is None:
@@ -433,16 +452,27 @@ class Publisher:
                 active = {"short_name": name, "manifest_path": str(manifest_path),
                           "manifest_hash": manifest_hash, "interval_seconds": interval_seconds,
                           "scheduled_for": next_due if next_due is not None else self.now()}
+                if schedule_ahead_seconds:
+                    anchor = active["scheduled_for"]
+                    # Leave time for emoji uploads and photo generation before
+                    # fixing a new server-side delivery slot.
+                    periods = max(0, math.floor((self.now() + _SCHEDULE_PREPARATION_SECONDS - anchor) / interval_seconds) + 1)
+                    active["delivery_at"] = math.ceil(anchor + periods * interval_seconds)
                 self.state.put("daily_active_pack", active)
             pack = next((pack for pack in document["packs"] if pack["short_name"] == name), None)
             if pack is None:
                 raise ReconciliationRequired("Ежедневный пак отсутствует в закреплённом manifest.")
+            if any(post[0] != active.get("delivery_at") for post in self.state.db.execute(
+                    "SELECT schedule_at FROM posts WHERE pack_name=?", (name,))):
+                raise ReconciliationRequired("Время сообщений не совпадает с закреплённым ежедневным выпуском.")
             try:
                 account, channel, capabilities = await self._publication_context(document, checked_config)
                 await self._pack(channel, pack, bool(account.get("premium")), document["brand"],
-                                 capabilities["max_caption_length"])
+                                 capabilities["max_caption_length"], schedule_at=active.get("delivery_at"))
             except DeferredPublication as error:
                 return self._daily_result("deferred", name, not_before=error.not_before, operation=error.operation)
+            if self.state.db.execute("SELECT status FROM packs WHERE short_name=?", (name,)).fetchone()[0] == "scheduled":
+                return self._daily_result("scheduled", name, scheduled_for=active["delivery_at"])
             return self._complete_daily(active)
 
     def _freeze_plan(self, document, config, manifest_hash):
@@ -522,10 +552,10 @@ class Publisher:
                 raise ReconciliationRequired("Сохранённый канал больше не совпадает с планом или не принадлежит этому аккаунту. Публикация остановлена; проверьте владельца, название, описание и username канала.")
         return channel
 
-    def _insert_post(self, key, pack_name, part, body, documents=None, links=None, photo_path=None, photo_sha256=None, formatting=None):
-        self.state.db.execute("INSERT INTO posts(key,pack_name,part,random_id,body,documents,links,photo_path,photo_sha256,formatting) VALUES(?,?,?,?,?,?,?,?,?,?)",
+    def _insert_post(self, key, pack_name, part, body, documents=None, links=None, photo_path=None, photo_sha256=None, formatting=None, schedule_at=None):
+        self.state.db.execute("INSERT INTO posts(key,pack_name,part,random_id,body,documents,links,photo_path,photo_sha256,formatting,schedule_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                               (key, pack_name, part, secrets.randbelow(2**63 - 1) + 1,
-                               body, _json(documents or []), _json(links or []), photo_path, photo_sha256, _json(formatting or [])))
+                               body, _json(documents or []), _json(links or []), photo_path, photo_sha256, _json(formatting or []), schedule_at))
 
     def _plan_welcome(self, brand):
         if self.state.db.execute("SELECT 1 FROM posts WHERE key='welcome'").fetchone():
@@ -538,8 +568,35 @@ class Publisher:
         with self.state.db:
             self._insert_post("welcome", None, 0, body)
 
+    async def _bind_sent_post(self, post, result):
+        if (not isinstance(result, dict) or result.get("scheduled")
+                or type(result.get("id")) is not int or result["id"] <= 0
+                or not _https(result.get("link"))):
+            raise ReconciliationRequired("Сверка сообщения Telegram вернула неполный результат. Сохранённый random_id не изменён.")
+        with self.state.db:
+            self.state.db.execute("UPDATE posts SET status='sent',message_id=?,url=? WHERE key=?",
+                                  (result["id"], result["link"], post["key"]))
+        await self._checkpoint()
+
+    async def _bind_scheduled_post(self, post, result):
+        if (not isinstance(result, dict) or type(result.get("id")) is not int or result["id"] <= 0
+                or type(result.get("scheduled_for")) is not int
+                or result["scheduled_for"] != post["schedule_at"]
+                or (post["scheduled_message_id"] is not None and result["id"] != post["scheduled_message_id"])):
+            raise ReconciliationRequired("Отложенное сообщение Telegram не совпадает с сохранёнными ID или временем публикации.")
+        if post["status"] == "scheduled" and post["scheduled_message_id"] == result["id"]:
+            return
+        with self.state.db:
+            self.state.db.execute("UPDATE posts SET status='scheduled',scheduled_message_id=?,message_id=NULL,url=NULL WHERE key=?",
+                                  (result["id"], post["key"]))
+        await self._checkpoint()
+
     async def _post(self, channel, key):
         post = self.state.db.execute("SELECT * FROM posts WHERE key=?", (key,)).fetchone()
+        schedule_at = post["schedule_at"]
+        if (schedule_at is not None and (type(schedule_at) is not int or schedule_at <= 0)
+                or post["status"] == "scheduled" and schedule_at is None):
+            raise ReconciliationRequired("Повреждено сохранённое время отложенного сообщения.")
         if post["photo_path"]:
             _read_checked(post["photo_path"], post["photo_sha256"], 10 * 1024 * 1024)
         if post["status"] == "sent":
@@ -547,28 +604,36 @@ class Publisher:
             if not exists:
                 raise ReconciliationRequired(f"Опубликованное сообщение {post['message_id']} отсутствует. Автоматическое восстановление отключено, чтобы не создавать повторы.")
             return
-        if post["status"] == "sending":
-            found = await self._call(f"find_post:{key}", self.transport.find_post, channel, post["body"])
-            if found:
-                if type(found.get("id")) is not int or found["id"] <= 0 or not _https(found.get("link")):
-                    raise ReconciliationRequired("Сверка сообщения Telegram вернула неполный результат.")
-                with self.state.db:
-                    self.state.db.execute("UPDATE posts SET status='sent',message_id=?,url=? WHERE key=?", (found["id"], found["link"], key))
-                await self._checkpoint()
+        if post["status"] == "sending" or schedule_at is not None:
+            lookup_options = {"photo_path": post["photo_path"]} if schedule_at is not None and post["photo_path"] else {}
+            found = await self._call(f"find_post:{key}", self.transport.find_post, channel, post["body"], **lookup_options)
+            if found is not None:
+                await self._bind_sent_post(post, found)
                 return
+        if schedule_at is not None:
+            scheduled = await self._call(f"find_scheduled_post:{key}", self.transport.find_scheduled_post,
+                                         channel, post["body"], **lookup_options)
+            if scheduled is not None:
+                await self._bind_scheduled_post(post, scheduled)
+                return
+            if post["status"] == "scheduled":
+                raise ReconciliationRequired("Отложенное сообщение отсутствует и в очереди Telegram, и в истории канала. Автоматическая повторная отправка остановлена.")
+            if schedule_at <= self.now() + _SCHEDULE_SEND_MARGIN_SECONDS:
+                raise ReconciliationRequired("Закреплённое время публикации уже прошло или слишком близко. Автоматический перенос и немедленная отправка отключены.")
         with self.state.db:
             self.state.db.execute("UPDATE posts SET status='sending' WHERE key=?", (key,))
         photo_options = {"photo_path": post["photo_path"]} if post["photo_path"] else {}
         if json.loads(post["formatting"]):
             photo_options["formatting"] = json.loads(post["formatting"])
+        if schedule_at is not None:
+            photo_options["schedule_at"] = schedule_at
         result = await self._call(f"send_post:{key}", self.transport.send_post,
                                   channel, post["body"], post["random_id"],
                                   json.loads(post["documents"]), json.loads(post["links"]), **photo_options)
-        if not isinstance(result, dict) or type(result.get("id")) is not int or result["id"] <= 0 or not _https(result.get("link")):
-            raise ReconciliationRequired("Telegram мог отправить сообщение, но не вернул его ID. Сохранённый random_id будет использован при повторе.")
-        with self.state.db:
-            self.state.db.execute("UPDATE posts SET status='sent',message_id=?,url=? WHERE key=?", (result["id"], result["link"], key))
-        await self._checkpoint()
+        if schedule_at is not None and isinstance(result, dict) and result.get("scheduled") is True:
+            await self._bind_scheduled_post(post, result)
+        else:
+            await self._bind_sent_post(post, result)
 
     def _check_set(self, remote, pack, expected):
         if (not isinstance(remote, dict) or not remote.get("creator") or not remote.get("emojis")
@@ -604,7 +669,7 @@ class Publisher:
                                               (_json(expected), pack["short_name"]))
         self._check_set(remote, pack, expected)
 
-    async def _pack(self, channel, pack, premium, brand, caption_limit=1024):
+    async def _pack(self, channel, pack, premium, brand, caption_limit=1024, *, schedule_at=None):
         name = pack["short_name"]
         keywords = [_search_keywords(item) for item in pack["items"]]
         row = self.state.db.execute("SELECT * FROM packs WHERE short_name=?", (name,)).fetchone()
@@ -613,7 +678,7 @@ class Publisher:
         if remote is not None:
             await self._accept_created_set(remote, pack, expected)
         else:
-            if row["status"] in {"created", "published"}:
+            if row["status"] in {"created", "scheduled", "published"}:
                 raise ReconciliationRequired(f"Ранее созданный пак {name} больше не найден; автоматическое повторное создание остановлено.")
             if expected is None:
                 expected = []
@@ -647,7 +712,7 @@ class Publisher:
         bound_documents = remote["documents"]
         for index, desired in enumerate(keywords):
             current = remote["documents"][index]
-            if sorted(word.casefold() for word in current.get("keywords", [])) != sorted(word.casefold() for word in filter(None, desired.split(","))):
+            if canonical_keywords(current.get("keywords", [])) != canonical_keywords(list(filter(None, desired.split(",")))):
                 remote = await self._call(f"keywords:{name}:{index + 1}",
                                           self.transport.change_keywords, current, desired)
                 self._check_set(remote, pack, bound_documents)
@@ -667,12 +732,17 @@ class Publisher:
                 bodies = _pack_posts(pack, remote["documents"], premium, brand)
             with self.state.db:
                 for part, body in enumerate(bodies, 1):
-                    self._insert_post(f"pack:{name}:{part}", name, part, **body)
+                    self._insert_post(f"pack:{name}:{part}", name, part, schedule_at=schedule_at, **body)
             existing_posts = list(self.state.db.execute("SELECT key FROM posts WHERE pack_name=? ORDER BY part", (name,)))
+        if schedule_at is not None and any(post[0] != schedule_at for post in self.state.db.execute(
+                "SELECT schedule_at FROM posts WHERE pack_name=?", (name,))):
+            raise ReconciliationRequired("Время сообщений не совпадает с закреплённым ежедневным выпуском.")
         for post in existing_posts:
             await self._post(channel, post["key"])
+        statuses = [post[0] for post in self.state.db.execute("SELECT status FROM posts WHERE pack_name=?", (name,))]
         with self.state.db:
-            self.state.db.execute("UPDATE packs SET status='published' WHERE short_name=?", (name,))
+            self.state.db.execute("UPDATE packs SET status=? WHERE short_name=?",
+                                  ("published" if all(status == "sent" for status in statuses) else "scheduled", name))
 
 
 def _pack_posts(pack, documents, premium, brand):
