@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coverpacks"
+version = "0.1.0"
+description = "Album cover collection and Telegram emoji packs"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx==0.28.1",
+    "Pillow==12.1.1",
+    "telethon==1.45.0",
+]
+
+[project.scripts]
+coverpacks = "coverpacks.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.0.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coverpacks"]

@@ -1,0 +1,14 @@
+.venv/
+.venv
+.venv-documents-backup/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+data/
+.env
+.DS_Store
+
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
