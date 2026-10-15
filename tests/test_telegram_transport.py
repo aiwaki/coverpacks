@@ -228,9 +228,12 @@ def test_verification_diagnostics_are_structured_and_exclude_private_references(
         "invalid_remote_image": emoji_bytes(size=(512, 512)),
     }[failure]
     if failure == "lowpass_distance":
-        source = chroma_checkerboard(3)
-        payload = webp_bytes(source)
-        remote, pack = content_verification_pack(tmp_path, [webp_bytes(source, lossless=True), contents[1]])
+        # Lanczos ringing raises the broad-scale residual slightly above four,
+        # although every original pixel differs by exactly four.
+        converted = Image.new("RGB", (100, 100))
+        converted.putdata([(100 + (-4 if ((x + 2) // 22) % 2 else 4),) * 3
+                           for y in range(100) for x in range(100)])
+        payload = webp_bytes(converted, lossless=True)
     assert run(TelegramTransport(DownloadClient([payload])).verify_set_content(remote, pack)) is False
     record = json.loads(caplog.records[-1].getMessage())
     assert record["event"] == "emoji_content_verification_failed"
@@ -238,14 +241,15 @@ def test_verification_diagnostics_are_structured_and_exclude_private_references(
     if failure in {"color_distance", "lowpass_distance", "ambiguous_source"}:
         assert record["nearest_other_position"] == 2
         if failure == "lowpass_distance":
-            assert record["model_distance"] == record["selected_distance"] == 0
-            assert record["lowpass_distance"] > 12
+            assert record["model_distance"] == record["selected_distance"] == 4
+            assert record["selected_lowpass_distance"] > 4
         else:
             distance = {"color_distance": 35, "ambiguous_source": 0}[failure]
             assert record["own_distance"] == record["lowpass_distance"] == distance
             assert record["nearest_other_distance"] == other - 100 - distance
         assert record["maximum_own_distance"] == record["maximum_model_distance"] == 4
-        assert record["maximum_lowpass_distance"] == 12
+        assert record["maximum_selected_lowpass_distance"] == 4
+        assert record["selected_representation"] in {"original", "webp_model"}
     elif failure == "alpha_mismatch":
         assert record["mismatch_pixels"] == 10000 and record["maximum_alpha_difference"] == 1
     else:
@@ -273,11 +277,33 @@ def test_verify_content_rejects_added_fine_noise_even_when_lowpass_matches(tmp_p
     assert run(TelegramTransport(DownloadClient([buffer.getvalue()])).verify_set_content(remote, pack)) is expected
 
 
-@pytest.mark.parametrize("period,expected", [(2, True), (3, False)])
-def test_verify_content_keeps_original_lowpass_gate_even_for_exact_codec_model(tmp_path, period, expected):
+@pytest.mark.parametrize("period", [1, 2, 3, 5, 8, 12])
+def test_verify_content_accepts_fixed_codec_loss_at_both_scales(tmp_path, period):
     source = chroma_checkerboard(period)
+    converted = webp_bytes(source)
+    if period == 3:
+        actual = _visible_rgb(Image.open(BytesIO(converted)).convert("RGBA"))
+        # The server's known conversion can exceed the former original-image
+        # lowpass gate even when it is exactly the expected result.
+        assert _rgb_rmse(actual.resize((32, 32), Image.Resampling.LANCZOS),
+                         _visible_rgb(source).resize((32, 32), Image.Resampling.LANCZOS)) > 12
     remote, pack = content_verification_pack(tmp_path, [webp_bytes(source, lossless=True)])
-    assert run(TelegramTransport(DownloadClient([webp_bytes(source)])).verify_set_content(remote, pack)) is expected
+    assert run(TelegramTransport(DownloadClient([converted])).verify_set_content(remote, pack)) is True
+
+
+@pytest.mark.parametrize("distance,expected", [(4, True), (5, False)])
+@pytest.mark.parametrize("pattern", ["broad_color", "fine_noise"])
+def test_verify_content_bounds_unexplained_changes_after_large_expected_codec_loss(tmp_path, distance, expected, pattern):
+    source = chroma_checkerboard(5, colors=((200, 55, 55), (55, 200, 200)))
+    converted = Image.open(BytesIO(webp_bytes(source))).convert("RGB")
+    assert _rgb_rmse(converted.resize((32, 32), Image.Resampling.LANCZOS),
+                     source.convert("RGB").resize((32, 32), Image.Resampling.LANCZOS)) > 12
+    altered = Image.new("RGB", converted.size)
+    altered.putdata([tuple(channel + (distance if pattern == "broad_color" or (x + y) % 2 else -distance)
+                           for channel in converted.getpixel((x, y)))
+                     for y in range(100) for x in range(100)])
+    remote, pack = content_verification_pack(tmp_path, [webp_bytes(source, lossless=True)])
+    assert run(TelegramTransport(DownloadClient([webp_bytes(altered, lossless=True)])).verify_set_content(remote, pack)) is expected
 
 
 def test_verify_content_accepts_modeled_chroma_loss_without_raw_threshold_or_margin_ratchet(tmp_path):

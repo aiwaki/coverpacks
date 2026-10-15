@@ -27,12 +27,12 @@ class TelegramResultError(RuntimeError):
 _STATIC_EMOJI_MAX_BYTES = 512 * 1024
 _CONTENT_RMSE_LIMIT = 4
 _CONTENT_LOWPASS_SIZE = (32, 32)
-_CONTENT_LOWPASS_LIMIT = 12
+_CONTENT_LOWPASS_LIMIT = 4
 _LOG = logging.getLogger(__name__)
 
 
 def _content_mismatch(reason: str, **facts) -> bool:
-    # Callers pass only fixed reason labels, positions and numeric image facts.
+    # Callers pass only fixed labels, positions and numeric image facts.
     # Telegram references, hashes, paths and source bytes must never be logged.
     _LOG.warning("%s", json.dumps({"event": "emoji_content_verification_failed", "reason": reason, **facts},
                                    sort_keys=True))
@@ -89,8 +89,9 @@ def _webp_rgb_model(rgba: Image.Image) -> Image.Image:
 
     Lossy WebP subsamples chroma; its decoded fine color edges can differ greatly
     from the lossless source. This one fixed encoder setting matched the saved
-    server conversions. A small residual budget accommodates codec differences;
-    alpha, original lowpass color and source uniqueness remain separate checks.
+    server conversions. A small residual budget accommodates codec differences
+    at both full resolution and lowpass. Expected chroma loss is not an identity
+    failure; alpha and source uniqueness remain separate checks.
     """
     buffer = BytesIO()
     rgba.save(buffer, "WEBP", quality=85, method=4)
@@ -425,8 +426,10 @@ class TelegramTransport:
 
         Telegram converts static uploads to WebP and can change both IDs and
         pixels. Compare both the original and one fixed WebP conversion model.
-        A positional match must preserve alpha and broad color/layout and be
-        clearly better than every other source. Ambiguity fails closed.
+        A positional match must preserve alpha, match one expected version at
+        both scales, and be clearly better than every other source. This checks
+        identity rather than the visual quality of Telegram's conversion.
+        Ambiguity fails closed.
         Transport errors propagate so the caller can retry this read later.
         """
         items, documents = pack.get("items", []), remote.get("documents", [])
@@ -456,9 +459,10 @@ class TelegramTransport:
                     return _content_mismatch("invalid_local_image", position=len(sources) + 1,
                                              expected_width=100, expected_height=100, actual=_image_facts(content))
                 rgb = _visible_rgb(rgba)
+                model = _webp_rgb_model(rgba)
                 sources.append((rgb, rgba.getchannel("A"),
                                 rgb.resize(_CONTENT_LOWPASS_SIZE, Image.Resampling.LANCZOS),
-                                _webp_rgb_model(rgba)))
+                                model, model.resize(_CONTENT_LOWPASS_SIZE, Image.Resampling.LANCZOS)))
         except (KeyError, TypeError, OSError, ValueError):
             return _content_mismatch("local_image_unavailable", position=len(sources) + 1)
         for index, location in enumerate(locations):
@@ -482,10 +486,19 @@ class TelegramTransport:
             rgb = _visible_rgb(actual)
             own_distance = _rgb_rmse(rgb, sources[index][0])
             model_distance = _rgb_rmse(rgb, sources[index][3])
-            selected_distance = min(own_distance, model_distance)
-            # Also compare broad color/layout against the unconverted original;
-            # a matching codec model alone cannot excuse excessive visible loss.
-            lowpass_distance = _rgb_rmse(rgb.resize(_CONTENT_LOWPASS_SIZE, Image.Resampling.LANCZOS), sources[index][2])
+            lowpass = rgb.resize(_CONTENT_LOWPASS_SIZE, Image.Resampling.LANCZOS)
+            lowpass_distance = _rgb_rmse(lowpass, sources[index][2])
+            model_lowpass_distance = _rgb_rmse(lowpass, sources[index][4])
+            # Use one expected version for both scales. Fixed WebP conversion
+            # can itself change broad colors, so bound only the unexplained
+            # residual; increasing the original-image tolerance would also
+            # excuse unrelated changes. Keep original distances as diagnostics.
+            candidates = [(own_distance, lowpass_distance, "original"),
+                          (model_distance, model_lowpass_distance, "webp_model")]
+            matches = [candidate for candidate in candidates
+                       if candidate[0] <= _CONTENT_RMSE_LIMIT and candidate[1] <= _CONTENT_LOWPASS_LIMIT]
+            selected_distance, selected_lowpass_distance, representation = min(matches or candidates,
+                                                                                key=lambda candidate: candidate[0])
             others = [(min(_rgb_rmse(rgb, source[0]), _rgb_rmse(rgb, source[3])), other + 1)
                       for other, source in enumerate(sources) if other != index]
             nearest_distance, nearest_position = min(others) if others else (None, None)
@@ -497,11 +510,15 @@ class TelegramTransport:
                      "maximum_model_distance": _CONTENT_RMSE_LIMIT,
                      "selected_distance": round(selected_distance, 4),
                      "maximum_selected_distance": _CONTENT_RMSE_LIMIT,
-                     "lowpass_distance": round(lowpass_distance, 4), "maximum_lowpass_distance": _CONTENT_LOWPASS_LIMIT,
+                     "selected_representation": representation,
+                     "lowpass_distance": round(lowpass_distance, 4),
+                     "model_lowpass_distance": round(model_lowpass_distance, 4),
+                     "selected_lowpass_distance": round(selected_lowpass_distance, 4),
+                     "maximum_selected_lowpass_distance": _CONTENT_LOWPASS_LIMIT,
                      "minimum_other_distance": round(minimum_other_distance, 4)}
             if selected_distance > _CONTENT_RMSE_LIMIT:
                 return _content_mismatch("color_distance", **facts)
-            if lowpass_distance > _CONTENT_LOWPASS_LIMIT:
+            if selected_lowpass_distance > _CONTENT_LOWPASS_LIMIT:
                 return _content_mismatch("lowpass_distance", **facts)
             if nearest_distance is not None and nearest_distance < minimum_other_distance:
                 return _content_mismatch("ambiguous_source", **facts)

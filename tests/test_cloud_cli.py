@@ -255,7 +255,8 @@ def test_retry_checkpoint_failure_stops_before_reconnect(monkeypatch):
     assert calls == ["daily", "checkpoint"]
 
 
-@pytest.mark.parametrize("result", [{"status": "deferred"}, {"status": "not_due"}])
+@pytest.mark.parametrize("result", [{"status": "deferred"}, {"status": "not_due"},
+                                   {"status": "waiting_for_covers", "ready": 199, "required": 200}])
 def test_daily_terminal_result_does_not_retry_or_wait(monkeypatch, result):
     calls = []
 

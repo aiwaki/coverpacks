@@ -320,11 +320,93 @@ def test_repeated_unchanged_head_has_no_duplicate_entries_or_publications(case):
     first = run(case)
     case.timestamp += 86400
     second = run(case)
-    assert first["status"] == second["status"] == "empty"
+    assert first["status"] == second["status"] == "waiting_for_covers"
+    assert first["ready"] == second["ready"] == 0
+    assert first["required"] == second["required"] == 2
     assert len(case.collector.head_calls) == 2
     assert case.state.rows(case.task_id) == [old_row]
     assert case.transport_opens == 0 and case.transport.events == []
     assert case.ledger.db.execute("SELECT COUNT(*) FROM packs").fetchone()[0] == 1
+
+
+def test_199_unique_covers_wait_for_full_200_without_freezing_or_advancing_slot(case):
+    case.settings["pack_size"] = 200
+    case.ledger.put("daily_next_due_at", case.timestamp)
+    for number in range(2, 201):
+        add_cover(case.state, case.task_id, number)
+    case.collector.on_run = lambda: None
+    before = daily.manifest_path(case.state.root, "sleeve_vinyl")
+    assert run(case) == {"status": "waiting_for_covers", "ready": 199, "required": 200,
+                         "next_due_at": case.timestamp}
+    assert daily.manifest_path(case.state.root, "sleeve_vinyl") == before
+    assert case.ledger.get("daily_collection") is None
+    assert case.ledger.get("daily_active_pack") is None
+    assert case.transport_opens == 0 and case.transport.events == []
+    assert case.ledger.db.execute("SELECT COUNT(*) FROM packs").fetchone()[0] == 1
+    add_cover(case.state, case.task_id, 201)
+    assert run(case)["pack"] == "sleeve_vinyl_002"
+    document = json.loads(daily.manifest_path(case.state.root, "sleeve_vinyl").read_bytes())
+    assert [len(pack["items"]) for pack in document["packs"]] == [1, 200]
+
+
+def test_exhausted_tail_refreshes_new_head_after_restart_and_accumulates_before_publishing(case, request):
+    from coverpacks.bandcamp import BandcampCollector, BandcampPage
+    from test_bandcamp import FakeAPI, FakeNetwork, art_url, sanitized
+
+    payloads = {}
+    for number, color in ((2, "pink"), (3, "green")):
+        output = io.BytesIO()
+        Image.new("RGB", (600, 600), color).save(output, "PNG")
+        payloads[art_url(number)] = output.getvalue()
+    api = FakeAPI({"*": BandcampPage([sanitized(2)], None, 1)})
+    network = FakeNetwork(case.state.root, payloads=payloads, dimensions=(600, 600))
+    case.state.set_task(case.task_id, exhausted="previous tail exhausted")
+    case.collector = BandcampCollector(case.state, api, network)
+    assert run(case)["status"] == "waiting_for_covers"
+    assert case.transport_opens == 0
+    first_new = case.state.rows(case.task_id)[1]
+    assert first_new["status"] == "downloaded"
+    assert case.ledger.get("daily_collection") is None
+    root = case.state.root
+    case.state.close()
+    case.ledger.close()
+    case.state, case.ledger = State(root), PublicationState(root / "telegram")
+    request.addfinalizer(case.state.close)
+    request.addfinalizer(case.ledger.close)
+    case.collector = BandcampCollector(case.state, api, network)
+    case.timestamp += 86400
+    # An unchanged head is a successful wait, even after reopening both stores.
+    assert run(case)["status"] == "waiting_for_covers"
+    assert case.state.rows(case.task_id)[1] == first_new
+    assert network.calls == [art_url(2)]
+    assert case.transport_opens == 0
+    api.pages["*"] = BandcampPage([sanitized(3), sanitized(2)], None, 2)
+    case.timestamp += 86400
+    assert run(case)["pack"] == "sleeve_vinyl_002"
+    assert api.fresh_calls == [True, True, True]
+    assert network.calls == [art_url(2), art_url(3)]
+    assert case.state.task(case.task_id)["exhausted"] == "previous tail exhausted"
+    document = json.loads(daily.manifest_path(root, "sleeve_vinyl").read_bytes())
+    assert [item["source_entity_id"] for item in document["packs"][1]["items"]] == [
+        "bandcamp:album:10:2", "bandcamp:album:10:3"]
+
+
+def test_checkpoint_failure_while_waiting_preserves_covers_and_retargets_next_attempt(case):
+    case.collector.on_run = case.collector.add_one
+    def stop_after_collection_cleanup():
+        if case.state.count(case.task_id) == 2 and case.ledger.get("daily_collection") is None:
+            case.on_checkpoint = None
+            raise OSError("waiting checkpoint response lost")
+    case.on_checkpoint = stop_after_collection_cleanup
+    with pytest.raises(OSError, match="waiting checkpoint"):
+        run(case)
+    assert case.transport_opens == 0
+    assert json.loads(daily.manifest_path(case.state.root, "sleeve_vinyl").read_bytes()) == case.original_manifest
+    assert run(case)["pack"] == "sleeve_vinyl_002"
+    assert len(case.collector.head_calls) == 2
+    assert [call["target"] for call in case.collector.run_calls] == [3, 3]
+    document = json.loads(daily.manifest_path(case.state.root, "sleeve_vinyl").read_bytes())
+    assert len(document["packs"][1]["items"]) == 2
 
 
 def test_needed_media_includes_prepared_pack_before_ledger_and_omits_published_originals(case):
@@ -387,11 +469,11 @@ def test_prepared_pending_or_active_pack_publishes_despite_source_cooldown(case,
     assert case.ledger.get("bandcamp_not_before") == deadline
 
 
-@pytest.mark.parametrize("ready_cover", [False, True])
+@pytest.mark.parametrize("ready_covers", [0, 1, 2])
 @pytest.mark.parametrize("deadline_source", ["report", "collector"])
-def test_head_rate_limit_checkpoints_deadline_skips_collection_and_uses_ready_covers(case, ready_cover, deadline_source):
-    if ready_cover:
-        add_cover(case.state, case.task_id, 2)
+def test_head_rate_limit_checkpoints_deadline_skips_collection_and_publishes_only_full_pack(case, ready_covers, deadline_source):
+    for number in range(2, 2 + ready_covers):
+        add_cover(case.state, case.task_id, number)
     deadline = case.timestamp + 90
     snapshots = []
     def limited_head():
@@ -413,10 +495,10 @@ def test_head_rate_limit_checkpoints_deadline_skips_collection_and_uses_ready_co
     assert case.ledger.get("bandcamp_not_before") == deadline
     assert any(saved == deadline and cycle and cycle.get("head_report", {}).get("stopped") == "rate_limited"
                and runs == opened == 0 for saved, cycle, runs, opened in snapshots)
-    if ready_cover:
+    if ready_covers == 2:
         assert result["status"] == "published" and result["pack"] == "sleeve_vinyl_002"
         document = json.loads(daily.manifest_path(case.state.root, "sleeve_vinyl").read_bytes())
-        assert [item["seq"] for item in document["packs"][1]["items"]] == [2]
+        assert [item["seq"] for item in document["packs"][1]["items"]] == [2, 3]
         assert case.transport_opens == 1
     else:
         assert result["status"] == "source_deferred" and result["not_before"] == deadline
@@ -502,7 +584,7 @@ def test_saved_daily_target_ignores_normalized_album_duplicates_in_frozen_and_re
     assert case.state.count(case.task_id) == 6
 
 
-def test_duplicates_arriving_during_collection_allow_partial_pack_and_next_day_progress(case):
+def test_duplicates_arriving_during_collection_wait_then_retarget_to_complete_same_pack(case):
     def collect_with_duplicate():
         add_cover(case.state, case.task_id, 1000, artist=" ARTIST 1 ", title="album　1")
         add_cover(case.state, case.task_id, 1001)
@@ -510,14 +592,18 @@ def test_duplicates_arriving_during_collection_allow_partial_pack_and_next_day_p
         case.collector.on_run = None
     case.collector.on_run = collect_with_duplicate
     first = run(case)
-    assert first["status"] == "published" and first["pack"] == "sleeve_vinyl_002"
+    assert first == {"status": "waiting_for_covers", "ready": 1, "required": 2, "next_due_at": None}
     assert [call["target"] for call in case.collector.run_calls] == [3]
     first_manifest = json.loads(daily.manifest_path(case.state.root, "sleeve_vinyl").read_bytes())
-    assert [item["source_entity_id"] for item in first_manifest["packs"][1]["items"]] == ["bandcamp:album:10:1001"]
+    assert first_manifest == case.original_manifest
+    assert case.ledger.get("daily_collection") is None
+    assert case.transport_opens == 0 and case.transport.events == []
     case.timestamp += 86400
     second = run(case)
-    assert second["status"] == "published" and second["pack"] == "sleeve_vinyl_003"
-    assert [call["target"] for call in case.collector.run_calls] == [3, 5]
+    assert second["status"] == "published" and second["pack"] == "sleeve_vinyl_002"
+    assert [call["target"] for call in case.collector.run_calls] == [3, 4]
+    assert len(case.collector.head_calls) == 2
     final_manifest = json.loads(daily.manifest_path(case.state.root, "sleeve_vinyl").read_bytes())
-    assert final_manifest["packs"][:2] == first_manifest["packs"]
-    assert len(final_manifest["packs"][2]["items"]) == 2
+    assert final_manifest["packs"][:1] == first_manifest["packs"]
+    assert [item["source_entity_id"] for item in final_manifest["packs"][1]["items"]] == [
+        "bandcamp:album:10:1001", "bandcamp:album:10:1002"]

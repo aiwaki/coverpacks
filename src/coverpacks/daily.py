@@ -170,6 +170,18 @@ async def run_daily(state, ledger, config, settings, transport_factory, checkpoi
         else:
             async with Network(settings["contact"], state.root, concurrency=3) as network:
                 await collect(BandcampCollector(state, BandcampAPI(network), network))
+        ready = _ready_count(state, task_id, document, capacity)
+        if ready < capacity:
+            # Keep the downloaded covers, but never freeze a partial daily pack.
+            # A completed short collection needs a new head refresh and target
+            # next time: raw download counts can include duplicate albums.
+            ledger.put("daily_collection", None)
+            await checkpoint()
+            if now() < (ledger.get("bandcamp_not_before") or 0):
+                return {"status": "source_deferred", "not_before": ledger.get("bandcamp_not_before"),
+                        "ready": ready, "required": capacity}
+            return {"status": "waiting_for_covers", "ready": ready, "required": capacity,
+                    "next_due_at": ledger.get("daily_next_due_at")}
         manifest = prepare(state, task_id, pack_size=capacity, prefix=prefix,
                            archived_packs=published, max_new_items=capacity)
         # A crash after this commit resumes the prepared manifest, never collects
