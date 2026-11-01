@@ -426,9 +426,10 @@ class TelegramTransport:
 
         Telegram converts static uploads to WebP and can change both IDs and
         pixels. Compare both the original and one fixed WebP conversion model.
-        A positional match must preserve alpha, match one expected version at
-        both scales, and be clearly better than every other source. This checks
-        identity rather than the visual quality of Telegram's conversion.
+        A positional match must preserve alpha and match one expected version
+        at both scales. Exact pixels must identify only one source; approximate
+        matches also need a clear distance margin over every other source. This
+        checks identity rather than the visual quality of Telegram's conversion.
         Ambiguity fails closed.
         Transport errors propagate so the caller can retry this read later.
         """
@@ -502,13 +503,19 @@ class TelegramTransport:
             others = [(min(_rgb_rmse(rgb, source[0]), _rgb_rmse(rgb, source[3])), other + 1)
                       for other, source in enumerate(sources) if other != index]
             nearest_distance, nearest_position = min(others) if others else (None, None)
-            minimum_other_distance = max(2 * selected_distance, selected_distance + 8)
+            # A unique exact decoded match already identifies its source, even
+            # when another cover looks similar. Do not apply the uncertainty
+            # margin for approximate conversions to this stronger evidence.
+            # Equal pixels from another original or codec model remain ambiguous.
+            exact_pixel_match = selected_distance == 0
+            minimum_other_distance = 0 if exact_pixel_match else max(2 * selected_distance, selected_distance + 8)
             facts = {"position": index + 1, "own_distance": round(own_distance, 4),
                      "nearest_other_distance": round(nearest_distance, 4) if nearest_distance is not None else None,
                      "nearest_other_position": nearest_position, "maximum_own_distance": _CONTENT_RMSE_LIMIT,
                      "model_distance": round(model_distance, 4),
                      "maximum_model_distance": _CONTENT_RMSE_LIMIT,
                      "selected_distance": round(selected_distance, 4),
+                     "exact_pixel_match": exact_pixel_match,
                      "maximum_selected_distance": _CONTENT_RMSE_LIMIT,
                      "selected_representation": representation,
                      "lowpass_distance": round(lowpass_distance, 4),
@@ -520,7 +527,8 @@ class TelegramTransport:
                 return _content_mismatch("color_distance", **facts)
             if selected_lowpass_distance > _CONTENT_LOWPASS_LIMIT:
                 return _content_mismatch("lowpass_distance", **facts)
-            if nearest_distance is not None and nearest_distance < minimum_other_distance:
+            if nearest_distance is not None and (nearest_distance == 0 if exact_pixel_match
+                                                 else nearest_distance < minimum_other_distance):
                 return _content_mismatch("ambiguous_source", **facts)
         return True
 

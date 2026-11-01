@@ -153,6 +153,31 @@ def test_verify_content_matches_ordered_images_after_ids_change(tmp_path):
         assert location.thumb_size == "" and part_size == 64
 
 
+def test_verify_content_accepts_unique_exact_originals_among_similar_sources(tmp_path):
+    contents = [emoji_bytes((shade, shade, shade, 255)) for shade in (100, 104)]
+    remote, pack = content_verification_pack(tmp_path, contents)
+    assert run(TelegramTransport(DownloadClient(contents)).verify_set_content(remote, pack)) is True
+
+
+def test_verify_content_accepts_unique_exact_codec_outputs_among_similar_sources(tmp_path):
+    images = []
+    for shift in (0, 3):
+        image = Image.new("RGBA", (100, 100))
+        image.putdata([(30 + shift + x // 3, 40 + shift + y // 4, 80 + shift, 255)
+                       for y in range(100) for x in range(100)])
+        images.append(image)
+    originals = [webp_bytes(image, lossless=True) for image in images]
+    converted = [webp_bytes(image) for image in images]
+    decoded = [_visible_rgb(Image.open(BytesIO(content)).convert("RGBA")) for content in converted]
+    # Both are changed by the codec, and the two outputs are closer than the
+    # approximate-conversion margin. Each still matches only its own model.
+    assert all(_rgb_rmse(actual, _visible_rgb(source)) > 0 for actual, source in zip(decoded, images))
+    assert 0 < _rgb_rmse(*decoded) < 8
+    remote, pack = content_verification_pack(tmp_path, originals)
+    assert run(TelegramTransport(DownloadClient(converted)).verify_set_content(remote, pack)) is True
+    assert run(TelegramTransport(DownloadClient(converted[::-1])).verify_set_content(remote, pack)) is False
+
+
 def test_verify_content_accepts_lossy_server_conversion(tmp_path):
     images = []
     for shift in (0, 100):
@@ -223,7 +248,7 @@ def test_verification_diagnostics_are_structured_and_exclude_private_references(
     payload = {
         "color_distance": emoji_bytes((135, 135, 135, 255)),
         "lowpass_distance": emoji_bytes((113, 113, 113, 255)),
-        "ambiguous_source": contents[0],
+        "ambiguous_source": emoji_bytes((101, 101, 101, 255)),
         "alpha_mismatch": emoji_bytes((100, 100, 100, 254)),
         "invalid_remote_image": emoji_bytes(size=(512, 512)),
     }[failure]
@@ -244,7 +269,7 @@ def test_verification_diagnostics_are_structured_and_exclude_private_references(
             assert record["model_distance"] == record["selected_distance"] == 4
             assert record["selected_lowpass_distance"] > 4
         else:
-            distance = {"color_distance": 35, "ambiguous_source": 0}[failure]
+            distance = {"color_distance": 35, "ambiguous_source": 1}[failure]
             assert record["own_distance"] == record["lowpass_distance"] == distance
             assert record["nearest_other_distance"] == other - 100 - distance
         assert record["maximum_own_distance"] == record["maximum_model_distance"] == 4
@@ -340,9 +365,22 @@ def test_verify_content_rejects_different_sources_collapsing_to_identical_codec_
     originals = [webp_bytes(source, lossless=True) for source in sources]
     converted = [webp_bytes(source) for source in sources]
     assert originals[0] != originals[1]
-    assert _rgb_rmse(*[_visible_rgb(Image.open(BytesIO(content)).convert("RGBA")) for content in converted]) < 4
+    assert _rgb_rmse(*[_visible_rgb(Image.open(BytesIO(content)).convert("RGBA")) for content in converted]) == 0
     remote, pack = content_verification_pack(tmp_path, originals)
     assert run(TelegramTransport(DownloadClient(converted)).verify_set_content(remote, pack)) is False
+
+
+def test_verify_content_rejects_exact_collision_between_codec_model_and_other_original(tmp_path, caplog):
+    source = chroma_checkerboard(8)
+    converted = webp_bytes(source)
+    other = Image.open(BytesIO(converted)).convert("RGBA")
+    originals = [webp_bytes(source, lossless=True), webp_bytes(other, lossless=True)]
+    remote, pack = content_verification_pack(tmp_path, originals)
+    assert run(TelegramTransport(DownloadClient([converted])).verify_set_content(remote, pack)) is False
+    record = json.loads(caplog.records[-1].getMessage())
+    assert record["reason"] == "ambiguous_source"
+    assert record["exact_pixel_match"] is True
+    assert record["selected_distance"] == record["nearest_other_distance"] == record["minimum_other_distance"] == 0
 
 
 def test_verify_content_rejects_swapped_server_conversions(tmp_path):
@@ -369,15 +407,16 @@ def test_verify_content_accepts_chroma_loss_in_saturated_text_but_rejects_wrong_
     assert run(TelegramTransport(DownloadClient([wrong.getvalue()])).verify_set_content(remote, pack)) is False
 
 
-def test_verify_content_rejects_swapped_items_even_when_both_are_close(tmp_path):
-    contents = [emoji_bytes((100, 100, 100, 255)), emoji_bytes((120, 120, 120, 255))]
+@pytest.mark.parametrize("other", [104, 120])
+def test_verify_content_rejects_swapped_items_even_when_both_are_close(tmp_path, other):
+    contents = [emoji_bytes((100, 100, 100, 255)), emoji_bytes((other, other, other, 255))]
     remote, pack = content_verification_pack(tmp_path, contents)
     client = DownloadClient(list(reversed(contents)))
     assert run(TelegramTransport(client).verify_set_content(remote, pack)) is False
     assert len(client.downloads) == 1
 
 
-@pytest.mark.parametrize("other,converted", [(100, 100), (104, 100), (125, 110), (110, 102)])
+@pytest.mark.parametrize("other,converted", [(100, 100), (104, 101), (125, 110), (110, 102)])
 def test_verify_content_rejects_duplicates_or_ambiguous_nearest_source(tmp_path, other, converted):
     contents = [emoji_bytes((100, 100, 100, 255)), emoji_bytes((other,) * 3 + (255,))]
     remote, pack = content_verification_pack(tmp_path, contents)
