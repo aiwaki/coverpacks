@@ -212,12 +212,14 @@ def _validated_keywords(value: str) -> tuple[str, list[str]]:
 def canonical_keywords(values: list[str]) -> list[str]:
     """Compare search phrases with only observed Telegram normalization.
 
-    The server lowercases phrases and removed U+2122 from a verified keyword
-    response. Preserve every other symbol and phrase, including duplicates;
-    this is not a general punctuation/Unicode folding rule. Visible metadata
-    and the submitted keywords remain unchanged.
+    The server lowercases phrases, removes U+2122, and omits a standalone
+    country flag (a pair of regional indicators) from verified responses.
+    Preserve other symbols, embedded flags, empty phrases and duplicates;
+    this is not general emoji removal or punctuation/Unicode folding.
+    Visible metadata and the submitted keywords remain unchanged.
     """
-    return sorted(value.replace("\u2122", "").casefold() for value in values)
+    return sorted(value.replace("\u2122", "").casefold() for value in values
+                  if not (len(value) == 2 and all("\U0001f1e6" <= char <= "\U0001f1ff" for char in value)))
 
 
 def _post_record(channel: dict, message_id: int) -> dict:

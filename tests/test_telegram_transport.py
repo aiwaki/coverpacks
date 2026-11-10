@@ -1159,6 +1159,8 @@ def test_get_set_maps_keywords_by_document_id_not_returned_order():
 @pytest.mark.parametrize("value,returned", [
     ("Album title,Artist", ["artist", "album title"]), ("", []),
     ("Lego Pirates: 1989-1996,Dreamcastle™", ["lego pirates: 1989-1996", "dreamcastle"]),
+    ("🇯🇵,JAPAN,IMPORT,Imports,Isao,Suzuki,Quartet,+,2,Orang-Utan",
+     ["japan", "import", "imports", "isao", "suzuki", "quartet", "+", "2", "orang-utan"]),
 ])
 def test_change_keywords_preserves_art_and_emoji_and_verifies_reply(value, returned):
     client = FakeClient([keyword_set(returned)])
@@ -1179,6 +1181,14 @@ def test_change_keywords_preserves_art_and_emoji_and_verifies_reply(value, retur
     (["Album", "Dreamcastle™"], ["dreamcastle"]),
     (["Album", "Dreamcastle™"], ["album", "album", "dreamcastle"]),
     (["™"], []),
+    (["🇯🇵", "Album", "Artist"], ["album"]),
+    (["🇯🇵", "Album"], ["album", "album"]),
+    (["🇯🇵 Album"], ["album"]),
+    (["Album 🇯🇵"], ["album"]),
+    (["🇯"], []),
+    (["🇯🇵🇬"], []),
+    (["🎵"], []),
+    (["+"], []),
 ])
 def test_keyword_compatibility_keeps_all_other_content_and_phrase_counts_strict(expected, actual):
     assert canonical_keywords(expected) != canonical_keywords(actual)
@@ -1191,6 +1201,13 @@ def test_keyword_compatibility_does_not_mutate_inputs_or_guess_empty_phrase_remo
     original = ["Dreamcastle™", "Lego Pirates: 1989-1996", "™"]
     assert canonical_keywords(original) == ["", "dreamcastle", "lego pirates: 1989-1996"]
     assert original == ["Dreamcastle™", "Lego Pirates: 1989-1996", "™"]
+
+
+def test_keyword_compatibility_omits_only_complete_standalone_country_flags():
+    original = ["🇯🇵", "🇬🇧", "🇫🇷", "Album", "Album", "🇯🇵 Imports", "™"]
+    assert canonical_keywords(original) == ["", "album", "album", "🇯🇵 imports"]
+    assert original == ["🇯🇵", "🇬🇧", "🇫🇷", "Album", "Album", "🇯🇵 Imports", "™"]
+    assert canonical_keywords([""]) != canonical_keywords([])
 
 
 @pytest.mark.parametrize("value", ["x" * 65, "💿" * 33, ",".join(str(i) for i in range(21)),

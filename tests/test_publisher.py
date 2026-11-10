@@ -700,9 +700,13 @@ def test_keyword_update_lost_reply_resumes_without_repeating_write(setup):
     assert [event for event in writes(setup.transport) if event[0]=="change_keywords"]==changes
 
 
-def test_server_trademark_keyword_normalization_does_not_repeat_writes_or_change_visible_titles(setup):
+@pytest.mark.parametrize("artist,title", [
+    ("Dreamcastle™", "Lego Pirates: 1989-1996"),
+    ("🇯🇵 Japan Imports 🇯🇵", "🇯🇵 JAPAN IMPORT 🇯🇵 Isao Suzuki Quartet + 2 - Orang-Utan"),
+])
+def test_server_keyword_normalization_does_not_repeat_writes_or_change_visible_titles(setup, artist, title):
     document = json.loads(setup.path.read_bytes())
-    document["packs"][0]["items"][0].update(artist="Dreamcastle™", title="Lego Pirates: 1989-1996")
+    document["packs"][0]["items"][0].update(artist=artist, title=title)
     setup.path = setup.path.parent / "trademark.json"
     setup.path.write_text(json.dumps(document))
     original_manifest = setup.path.read_bytes()
@@ -712,7 +716,7 @@ def test_server_trademark_keyword_normalization_does_not_repeat_writes_or_change
         remote = await create_set(*args, **kwargs)
         saved = setup.transport.sets[remote["short_name"]]
         for item in saved["documents"]:
-            item["keywords"] = [word.replace("™", "").casefold() for word in item["keywords"]]
+            item["keywords"] = [word.replace("™", "").casefold() for word in item["keywords"] if word != "🇯🇵"]
         return copy.deepcopy(saved)
 
     setup.transport.create_set = normalized_create
@@ -722,7 +726,7 @@ def test_server_trademark_keyword_normalization_does_not_repeat_writes_or_change
     assert run(setup) == first
     assert writes(setup.transport) == before
     assert setup.path.read_bytes() == original_manifest
-    assert any("Dreamcastle™ — Lego Pirates: 1989-1996" in post["body"] for post in setup.transport.posts.values())
+    assert any(f"{artist} — {title}" in post["body"] for post in setup.transport.posts.values())
 
 
 def test_keyword_update_flood_persists_wait_before_further_posts(setup):
