@@ -122,28 +122,43 @@ def parse_artwork(html, image_id):
     return matches.pop()
 
 
+def _field(record, name, camel=None):
+    """Read one observed wire alias without changing persisted field names.
+
+    Reject duplicate aliases even when their values compare equal: otherwise
+    validation could silently prefer one identity or counter over another.
+    """
+    if camel is not None and name in record and camel in record:
+        raise ApiDataError(f"Bandcamp: неоднозначные поля {name}/{camel}")
+    return record.get(camel) if camel is not None and camel in record else record.get(name)
+
+
 def _sanitize(item):
     if not isinstance(item, dict):
         raise ApiDataError("Bandcamp: некорректная запись Discover")
-    item_id = _positive_id(item.get("item_id"), "item_id")
-    band_id = _positive_id(item.get("band_id"), "band_id")
-    item_type = item.get("item_type")
+    result = {name: _field(item, name, camel) for name, camel in (
+        ("item_id", "itemId"), ("item_type", "itemType"), ("result_type", "resultType"),
+        ("title", None), ("item_url", "itemUrl"), ("band_id", "bandId"),
+        ("album_artist", "albumArtist"), ("band_name", "bandName"), ("release_date", "releaseDate"),
+    )}
+    item_id = _positive_id(result["item_id"], "item_id")
+    band_id = _positive_id(result["band_id"], "band_id")
+    item_type = result["item_type"]
     if not isinstance(item_type, str) or not re.fullmatch(r"[a-z]{1,20}", item_type):
         raise ApiDataError("Bandcamp: некорректный item_type")
     kind = "album" if item_type == "a" else f"item-{item_type}"
-    result = {key: item.get(key) for key in (
-        "item_id", "item_type", "result_type", "title", "item_url", "band_id",
-        "album_artist", "band_name", "release_date",
-    )}
     result["id"] = f"bandcamp:{kind}:{band_id}:{item_id}"
-    primary = item.get("primary_image")
-    result["primary_image"] = ({key: primary.get(key) for key in ("image_id", "is_art")}
+    primary = _field(item, "primary_image", "primaryImage")
+    result["primary_image"] = ({name: _field(primary, name, camel) for name, camel in
+                                (("image_id", "imageId"), ("is_art", "isArt"))}
                                if isinstance(primary, dict) else None)
-    packages = item.get("package_info")
+    packages = _field(item, "package_info", "packageInfo")
     if not isinstance(packages, list) or any(not isinstance(p, dict) for p in packages):
         raise ApiDataError("Bandcamp: некорректный package_info")
     result["package_info"] = [
-        {key: package.get(key) for key in ("package_id", "format", "title", "is_preorder", "image_id", "type_id")}
+        {name: _field(package, name, camel) for name, camel in (
+            ("package_id", "packageId"), ("format", None), ("title", None),
+            ("is_preorder", "isPreorder"), ("image_id", "imageId"), ("type_id", "typeId"))}
         for package in packages
     ]
     return result
@@ -170,7 +185,8 @@ class BandcampAPI:
         if not isinstance(data, dict):
             raise ApiDataError("Bandcamp: Discover не вернул объект JSON")
         raw = data.get("results")
-        total, batch = data.get("result_count"), data.get("batch_result_count")
+        total = _field(data, "result_count", "resultCount")
+        batch = _field(data, "batch_result_count", "batchResultCount")
         if (not isinstance(raw, list) or len(raw) > size
                 or isinstance(total, bool) or not isinstance(total, int) or total < 0
                 or isinstance(batch, bool) or not isinstance(batch, int) or batch != len(raw)):

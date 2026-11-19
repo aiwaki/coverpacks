@@ -24,6 +24,16 @@ def item(number=1, **changes):
         **changes}
 
 
+def camel_item(number=1, **changes):
+    return {"itemId": number, "itemType": "a", "resultType": "a", "bandId": 10,
+        "title": f"Album {number}", "albumArtist": "Album artist", "bandName": "Label",
+        "releaseDate": "2026-10-02 00:00:00 UTC",
+        "itemUrl": f"https://label.bandcamp.com/album/album-{number}?from=discover_page",
+        "primaryImage": {"imageId": number, "isArt": True},
+        "packageInfo": [{"format": "vinyl", "packageId": number + 100, "title": "LP", "isPreorder": False}],
+        **changes}
+
+
 def art_url(number=1):
     return f"https://f4.bcbits.com/img/a{number:010d}_10.jpg"
 
@@ -37,6 +47,12 @@ def art_html(number=1, **changes):
 def page_data(items=None, cursor="next", **changes):
     items = items if items is not None else [item()]
     return {"results": items, "batch_result_count": len(items), "result_count": 100,
+            "cursor": cursor, **changes}
+
+
+def camel_page_data(items=None, cursor="next", **changes):
+    items = items if items is not None else [camel_item()]
+    return {"results": items, "batchResultCount": len(items), "resultCount": 100,
             "cursor": cursor, **changes}
 
 
@@ -148,6 +164,69 @@ def test_discovery_refresh_is_explicit_and_keeps_default_cache_behavior():
     asyncio.run(api.discover(fresh=True))
     assert network.fresh_calls == [False, True]
     assert network.calls[0] == network.calls[1]
+
+
+def test_camel_discovery_normalizes_to_the_existing_metadata_contract():
+    old = item()
+    old["package_info"][0].update(image_id=99, type_id=2)
+    camel = camel_item(playerData={"streamUrl": "do not store"}, isFollowingBand=True)
+    camel["packageInfo"][0].update(imageId=99, typeId=2, price={"amount": 2000})
+    camel["primaryImage"]["unrelatedField"] = "do not store"
+    old_page = asyncio.run(BandcampAPI(MetadataNetwork(page_data([old]))).discover())
+    network = MetadataNetwork(camel_page_data([camel]))
+    new_page = asyncio.run(BandcampAPI(network).discover(fresh=True))
+    assert new_page == old_page
+    assert new_page.items[0]["id"] == "bandcamp:album:10:1"
+    assert new_page.items[0]["package_info"][0]["image_id"] == 99
+    assert new_page.items[0]["package_info"][0]["type_id"] == 2
+    assert "playerData" not in new_page.items[0] and "isFollowingBand" not in new_page.items[0]
+    assert "price" not in new_page.items[0]["package_info"][0]
+    assert "unrelatedField" not in new_page.items[0]["primary_image"]
+    assert network.calls[0][1]["include_result_types"] == ["a", "s"]
+
+
+def test_discovery_accepts_unambiguous_mixed_aliases_at_each_known_level():
+    mixed = camel_item()
+    mixed["band_id"] = mixed.pop("bandId")
+    mixed["primaryImage"]["image_id"] = mixed["primaryImage"].pop("imageId")
+    mixed["packageInfo"][0]["is_preorder"] = mixed["packageInfo"][0].pop("isPreorder")
+    data = camel_page_data([mixed, item(2)])
+    data["result_count"] = data.pop("resultCount")
+    page = asyncio.run(BandcampAPI(MetadataNetwork(data)).discover())
+    assert page.items == [sanitized(1), sanitized(2)]
+
+
+@pytest.mark.parametrize("path,name,value", [
+    ((), "result_count", 100), ((), "batch_result_count", None),
+    (("results", 0), "item_id", 1), (("results", 0), "band_id", True),
+    (("results", 0), "item_type", "t"), (("results", 0), "item_url", "https://localhost/album/test"),
+    (("results", 0), "album_artist", "Other artist"),
+    (("results", 0), "primary_image", None), (("results", 0), "package_info", []),
+    (("results", 0, "primaryImage"), "image_id", True),
+    (("results", 0, "primaryImage"), "is_art", False),
+    (("results", 0, "packageInfo", 0), "package_id", 101),
+    (("results", 0, "packageInfo", 0), "is_preorder", True),
+])
+def test_discovery_rejects_duplicate_wire_aliases_instead_of_choosing_one(path, name, value):
+    data = camel_page_data()
+    target = data
+    for key in path:
+        target = target[key]
+    target[name] = value
+    with pytest.raises(ApiDataError, match="неоднозначные поля"):
+        asyncio.run(BandcampAPI(MetadataNetwork(data)).discover())
+
+
+@pytest.mark.parametrize("changes", [
+    {"results": None}, {"batchResultCount": 2}, {"batchResultCount": True},
+    {"resultCount": -1}, {"resultCount": True}, {"cursor": 123}, {"cursor": "*"},
+    {"results": [camel_item(itemId=0)]}, {"results": [camel_item(bandId=True)]},
+    {"results": [camel_item(itemType="../../album")]},
+    {"results": [camel_item(packageInfo=None)]},
+])
+def test_camel_discovery_retains_page_cursor_and_identity_validation(changes):
+    with pytest.raises(ApiDataError):
+        asyncio.run(BandcampAPI(MetadataNetwork(camel_page_data(**changes))).discover())
 
 
 @pytest.mark.parametrize("changes", [
@@ -294,6 +373,23 @@ def test_ineligible_or_invalid_candidate_never_requests_artwork(state, changes, 
     assert state.rows(task["id"])[0]["status"] == status
 
 
+@pytest.mark.parametrize("changes,status", [
+    ({"itemType": "t"}, "not_album"),
+    ({"packageInfo": [{"format": "cd", "packageId": 3}]}, "no_vinyl"),
+    ({"primaryImage": {"imageId": 1, "isArt": False}}, "no_front"),
+    ({"primaryImage": {"imageId": True, "isArt": True}}, "api_error"),
+    ({"itemUrl": "https://user:secret@artist.bandcamp.com/album/test"}, "api_error"),
+    ({"packageInfo": [{"format": "vinyl", "packageId": False}]}, "api_error"),
+])
+def test_camel_candidate_retains_eligibility_and_safe_artwork_checks(state, changes, status):
+    page = asyncio.run(BandcampAPI(MetadataNetwork(camel_page_data([camel_item(**changes)]))).discover())
+    task = stage(state, page.items)
+    api, network = FakeAPI(), FakeNetwork(state.root)
+    run(state, api, network, task)
+    assert not api.calls and not network.calls
+    assert state.rows(task["id"])[0]["status"] == status
+
+
 def test_result_preserves_bandcamp_provenance_without_fake_musicbrainz_ids(state):
     task = stage(state)
     run(state, FakeAPI(), FakeNetwork(state.root), task)
@@ -417,6 +513,45 @@ def test_head_refresh_preserves_old_queue_snapshots_and_originals_when_rank_chan
     assert state.task(task["id"]) == before_task and len(state.rows(task["id"])) == 4
     assert api.fresh_calls == [True] * 4
     assert network.calls == [art_url(1)]  # refresh itself never downloads artwork
+
+
+def test_camel_head_refresh_resumes_old_collection_without_replacing_or_downloading_known_items(tmp_path):
+    state = State(tmp_path)
+    task = state.create_task(config(), 1, 120)
+    state.stage_bandcamp_page(task["id"], [sanitized(1)], "saved-tail")
+    network = FakeNetwork(state.root)
+    run(state, FakeAPI(), network, task)
+    before_entry = tuple(state.db.execute("SELECT * FROM entries").fetchone())
+    row = state.rows(task["id"])[0]
+    path = state.root / row["path"]
+    before_file = path.read_bytes(), path.stat().st_mtime_ns
+    state.close()
+
+    resumed = State(tmp_path)
+    try:
+        resumed.set_task(task["id"], target=2)
+        before_task = resumed.task(task["id"])
+        metadata = MetadataNetwork(camel_page_data([
+            camel_item(1, title="Changed upstream"), camel_item(2)], cursor=None))
+        collector = BandcampCollector(resumed, BandcampAPI(metadata), network)
+        report = asyncio.run(collector.refresh_head(task["id"]))
+        assert report == {"pages": 1, "examined": 2, "added": 1, "known": 1, "stopped": "end_of_results"}
+        assert resumed.task(task["id"]) == before_task
+        assert tuple(resumed.db.execute("SELECT * FROM entries ORDER BY seq LIMIT 1").fetchone()) == before_entry
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == before_file
+
+        run(resumed, FakeAPI(), network, task)
+        assert resumed.count(task["id"]) == 2
+        assert network.calls == [art_url(1), art_url(2)]
+        assert [r["entity_id"] for r in resumed.rows(task["id"])] == ["bandcamp:album:10:1", "bandcamp:album:10:2"]
+        repeated = asyncio.run(collector.refresh_head(task["id"]))
+        assert repeated["added"] == 0 and repeated["known"] == 2
+        run(resumed, FakeAPI(), network, task)
+        assert network.calls == [art_url(1), art_url(2)]
+        assert tuple(resumed.db.execute("SELECT * FROM entries ORDER BY seq LIMIT 1").fetchone()) == before_entry
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == before_file
+    finally:
+        resumed.close()
 
 
 def test_head_refresh_passes_known_pages_but_respects_its_page_budget(state):
